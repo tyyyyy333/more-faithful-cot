@@ -79,6 +79,7 @@
 - `SegmentOTFDataset` 已改为在初始化阶段预编码 forget / retain 样本；
 - `__getitem__()` 不再重复调用 tokenizer 与 `qcot_encoder`；
 - `num_targets()` 不再通过 `self[idx]` 重跑完整编码路径；
+- `SegmentOTFDataset._preencode_samples()` 在 `pos_filter=False` 的主路径下已改为批量 tokenizer，而不是逐条调用 `qcot_encoder()`；
 - retain 仍暂时保持原版的“固定找到第一个可用样本”的语义。
 
 ### `v2/unlearn.py`
@@ -89,6 +90,14 @@
 - 上述缓存不再通过新增入口暴露，而是直接在 `unlearn_single()` 中构建，并由 `compute_loss()` 内部读取；
 - 同一个进程内对同一个 `(model_id, device)` 只保留一份共享 `oracle_model`，避免 stepwise 主路径对冻结参考模型反复 `from_pretrained()`；
 - `compute_specificity()` 已改为在函数内部使用 batch `generate()` 处理 held-out specificity 样本，而不是逐条调用；
+- `main()` 末尾原本粗糙的“外层三层循环”已改成：
+  - 先一次性展开 pending `(instance, step)` 任务队列；
+  - 先做 resume/skip 过滤；
+  - 再进入单层执行循环。
+- `compute_loss()` 内部原本重复展开的 forget/oracle 逻辑已折叠成单一路径：
+  - 当前模型 forget 前向只做一次；
+  - oracle forget loss 只取一次；
+  - `npo` / `npo_grad_diff` / `npo_KL` 在共享的 forget 结果上再分叉。
 - `v2` 的结果输出目录已与 `v1` 分离，写入 `v2_outputs/...`。
 
 ### `v2/evaluate.py`
@@ -142,6 +151,7 @@ python3 -m py_compile \
   - `qcot_encoder` 调用
   - retain 候选扫描
   改为在初始化阶段一次性完成。
+- 对 `pos_filter=False` 的主路径，`_preencode_samples()` 现在会先批量 tokenizer prompts / completions，再逐条拼接张量和 labels，而不是逐条单独编码。
 - 新增内部辅助逻辑：
   - `_build_prompt`
   - `_preencode_samples`
@@ -189,6 +199,7 @@ python3 -m py_compile \
 - 不再在每个训练 step 中重复计算同一个 forget oracle loss。
 - 对 `npo_KL` 主路径，不再重复计算 retain oracle 的 log-probs。
 - 不再为同一轮实验中的每个 step 重复加载同一份冻结 oracle 模型。
+- 不再在执行循环里重复展开 step、重复做 skip 判断和重复构造任务元信息，为后续进一步做 job-level batching 留出结构空间。
 
 ### 1.3 `evaluate.py`：把数据集级 CoT 生成改成批处理
 
@@ -225,10 +236,24 @@ python3 -m py_compile \
 
 为了控制风险，以下计划项这次没有动：
 
-- `qcot_encoder()` 的真正多样本编码接口。
-- `unlearn.py` 末尾多实例/多 step 的外层训练组织重构。
 - `segment.py` / POS 对齐路径的并行预处理。
 - 模型加载方式的重构。
+- `non-stepwise` 语义修复。
+
+## 4. 当前结论
+
+如果把第一阶段定义为：
+
+- 不改训练范式；
+- 只在复制版原文件中做缓存、批处理、向量化和执行组织收口；
+- 把主路径里明显的重复计算和单样本评估热点清掉；
+
+那么这一阶段现在已经闭合。
+
+剩余未做项已经不再属于“第一阶段收尾”，而属于下一层改造：
+
+- `segment.py` / POS 对齐路径的并行预处理；
+- 更进一步的模型加载/生命周期重构；
 - `non-stepwise` 语义修复。
 - loss 数学定义修改。
 

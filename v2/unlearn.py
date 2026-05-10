@@ -1,5 +1,7 @@
 import os, sys, gc, json, copy, random, argparse, subprocess, shutil
 from pprint import pprint
+from collections import defaultdict
+from pathlib import Path
 
 import torch
 from torch import nn
@@ -15,6 +17,9 @@ from torch.utils.data import DataLoader
 from evaluate import completion_probabilities, answer_probabilities, complete, generation_fixed_cot
 from data import FRCollator, cot_to_otfd, model_name_dict, load_or_generate_dataset_cots
 from dataload import DATASETS
+from adapter_trainer import AdapterTrainer, AdapterTrainingJob
+from adapter_runtime import AdapterRecord
+from lora_adapter import LoRAConfig, attach_lora_adapters
 from util import set_random_seed
 from models import resolve_device
 
@@ -66,91 +71,72 @@ def get_batch_loss(output, labels):
 
     return loss
 
-#TODO: 可能可以优化
 def compute_loss(model, oracle_model, inputs, loss_type='npo_grad_diff', ref_policy='fine_tuned', beta=0.1, npo_coeff=1.0, grad_diff_coeff=1.0, KL_coeff=1.0, return_outputs=False):
         oracle_cache = _ACTIVE_ORACLE_CACHE
-        ### Implement the NPO
+        forget_inputs, retain_inputs = inputs
+        input_ids, labels, attention_mask = forget_inputs
+        outputs = model(input_ids, labels=labels, attention_mask=attention_mask)
+
+        if ref_policy != 'fine_tuned':
+            raise NotImplementedError
+
+        forget_loss_current = get_batch_loss(outputs.logits, labels)
+        if oracle_cache is not None and 'forget_loss' in oracle_cache:
+            forget_loss_oracle = oracle_cache['forget_loss']
+        else:
+            with torch.no_grad():
+                forget_outputs_oracle = oracle_model(
+                    input_ids,
+                    labels=labels,
+                    attention_mask=attention_mask,
+                )
+            forget_loss_oracle = get_batch_loss(forget_outputs_oracle.logits, labels)
+
+        neg_log_ratios = forget_loss_current - forget_loss_oracle
+        forget_loss = -F.logsigmoid(beta * neg_log_ratios).mean() * 2 / beta
+
         if loss_type == 'npo':
-            forget_inputs, _ = inputs
-            input_ids, labels, attention_mask = forget_inputs
-            outputs = model(input_ids,labels=labels, attention_mask=attention_mask)
-
-            forget_loss_current = get_batch_loss(outputs.logits, labels) 
-
-            if ref_policy == 'fine_tuned':
-                if oracle_cache is not None and 'forget_loss' in oracle_cache:
-                    forget_loss_oracle = oracle_cache['forget_loss']
-                else:
-                    with torch.no_grad():
-                        forget_outputs_oracle = oracle_model(input_ids,labels=labels, attention_mask=attention_mask)
-                        forget_logits_oracle = forget_outputs_oracle.logits
-                        forget_loss_oracle = get_batch_loss(forget_logits_oracle, labels)
-                neg_log_ratios = forget_loss_current - forget_loss_oracle
-            else:
-                raise NotImplementedError
-            loss = - 2 / beta * F.logsigmoid(beta * neg_log_ratios).mean()
-
+            loss = forget_loss
         elif loss_type == 'npo_grad_diff':
-            forget_inputs, retain_inputs = inputs
-            input_ids, labels, attention_mask = forget_inputs
-
-            outputs = model(input_ids,labels=labels, attention_mask=attention_mask)
-            forget_loss_current = get_batch_loss(outputs.logits, labels) 
-
-            if ref_policy == 'fine_tuned':
-                if oracle_cache is not None and 'forget_loss' in oracle_cache:
-                    forget_loss_oracle = oracle_cache['forget_loss']
-                else:
-                    with torch.no_grad():
-                        forget_outputs_oracle = oracle_model(input_ids,labels=labels, attention_mask=attention_mask)
-                        forget_logits_oracle = forget_outputs_oracle.logits
-                        forget_loss_oracle = get_batch_loss(forget_logits_oracle, labels)
-                neg_log_ratios = forget_loss_current - forget_loss_oracle
-            else:
-                raise NotImplementedError
-            forget_loss = -F.logsigmoid(beta * neg_log_ratios).mean() * 2 / beta
-
             retain_input_ids, retain_labels, retain_attention_mask = retain_inputs
-            retain_outputs = model(retain_input_ids,labels=retain_labels, attention_mask=retain_attention_mask)
+            retain_outputs = model(
+                retain_input_ids,
+                labels=retain_labels,
+                attention_mask=retain_attention_mask,
+            )
             retain_loss = retain_outputs.loss
             loss = npo_coeff * forget_loss + grad_diff_coeff * retain_loss
-            
         elif loss_type == 'npo_KL':
-            forget_inputs, retain_inputs = inputs
-            input_ids, labels, attention_mask = forget_inputs
-            
-            outputs = model(input_ids,labels=labels, attention_mask=attention_mask)
-            forget_loss_current = get_batch_loss(outputs.logits, labels) 
-            
-            if ref_policy == 'fine_tuned':
-                if oracle_cache is not None and 'forget_loss' in oracle_cache:
-                    forget_loss_oracle = oracle_cache['forget_loss']
-                else:
-                    with torch.no_grad():
-                        forget_outputs_oracle = oracle_model(input_ids,labels=labels, attention_mask=attention_mask)
-                        forget_logits_oracle = forget_outputs_oracle.logits
-                        forget_loss_oracle = get_batch_loss(forget_logits_oracle, labels)
-                neg_log_ratios = forget_loss_current - forget_loss_oracle
-            else:
-                raise NotImplementedError
-            forget_loss = -F.logsigmoid(beta * neg_log_ratios).mean() * 2 / beta
-
             retain_input_ids, retain_labels, retain_attention_mask = retain_inputs
             if oracle_cache is not None and 'retain_log_probs' in oracle_cache:
                 retain_probs = oracle_cache['retain_log_probs']
             else:
                 with torch.no_grad():
-                    retain_outputs = oracle_model(retain_input_ids,labels=retain_labels, attention_mask=retain_attention_mask)
+                    retain_outputs = oracle_model(
+                        retain_input_ids,
+                        labels=retain_labels,
+                        attention_mask=retain_attention_mask,
+                    )
                 retain_probs = F.log_softmax(retain_outputs.logits, dim=-1)
                 retain_probs = retain_probs.view(-1, retain_outputs.logits.shape[-1])
 
-            current_outputs = model(retain_input_ids,labels=retain_labels, attention_mask=retain_attention_mask)
+            current_outputs = model(
+                retain_input_ids,
+                labels=retain_labels,
+                attention_mask=retain_attention_mask,
+            )
             current_probs = F.log_softmax(current_outputs.logits, dim=-1)
             current_probs = current_probs.view(-1, current_outputs.logits.shape[-1])
 
-            # minimum KL divergence
-            retain_loss = nn.functional.kl_div(current_probs, retain_probs, reduction='batchmean', log_target=True)
+            retain_loss = nn.functional.kl_div(
+                current_probs,
+                retain_probs,
+                reduction='batchmean',
+                log_target=True,
+            )
             loss = npo_coeff * forget_loss + KL_coeff * retain_loss
+        else:
+            raise NotImplementedError
 
         return (loss, outputs) if return_outputs else loss
 
@@ -451,6 +437,34 @@ def store(instance_info, fout):
     with open(fout, 'a') as outfile:
       outfile.write(json.dumps(instance_info)+"\n")
 
+
+def parse_lora_target_modules(raw_value: str) -> tuple[str, ...]:
+    if not raw_value.strip():
+        return tuple()
+    return tuple(part.strip() for part in raw_value.split(",") if part.strip())
+
+
+def sanitize_adapter_id(raw_value: str) -> str:
+    return (
+        raw_value.replace("/", "_")
+        .replace("\\", "_")
+        .replace(" ", "_")
+        .replace(":", "_")
+    )
+
+
+def make_adapter_id(target, step_idx: int, stepwise: bool) -> str:
+    base = str(target['id'])
+    if stepwise:
+        base = f"{base}_step_{step_idx}"
+    return sanitize_adapter_id(base)
+
+
+def chunk_list(items, chunk_size: int):
+    if chunk_size <= 0:
+        return [items]
+    return [items[start:start + chunk_size] for start in range(0, len(items), chunk_size)]
+
 def make_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_name', type=str, default='microsoft/Phi-3-mini-4k-instruct', help="Model name (hf) or local path")
@@ -500,6 +514,16 @@ def make_parser():
                         help="Skip post-unlearning CoT generation for faster runs.")
     parser.add_argument('--skip_initial_eval', action='store_true',
                         help="Skip epoch-0 evaluation and only evaluate at configured intervals.")
+    parser.add_argument('--lora_rank', type=int, default=8,
+                        help="LoRA rank for each adapter.")
+    parser.add_argument('--lora_alpha', type=float, default=16.0,
+                        help="LoRA alpha scaling.")
+    parser.add_argument('--lora_dropout', type=float, default=0.0,
+                        help="LoRA dropout.")
+    parser.add_argument('--lora_target_modules', type=str, default="",
+                        help="Comma-separated linear module suffixes to wrap with LoRA. Empty means all linear layers.")
+    parser.add_argument('--adapter_group_size', type=int, default=0,
+                        help="How many adapter jobs to train together in one batched group. 0 means all jobs.")
     parser.set_defaults(stepwise=True)
     
     return parser
@@ -579,60 +603,213 @@ def main():
     # Restore previous results 
     ids = load_ids(resdir + logfile_name, stepwise=args.stepwise)
     print(f"Ids so far: {len(ids)}")
+    if args.ff2:
+      raise ValueError("FF2-only optimization is incompatible with the multi-adapter LoRA training flow.")
+    if args.mmlu or args.gsm:
+      raise NotImplementedError("The multi-adapter LoRA flow does not yet support lm_eval export paths.")
 
+    base_model, device = load_causal_lm(model_id, args.device)
+    oracle_cache_key = (model_id, args.device)
+    if oracle_cache_key in _SHARED_ORACLE_MODELS:
+      oracle_model = _SHARED_ORACLE_MODELS[oracle_cache_key]
+    else:
+      oracle_model, _ = load_causal_lm(model_id, args.device)
+      _SHARED_ORACLE_MODELS[oracle_cache_key] = oracle_model
 
-    #n_targets 个样本， 每个样本 unlearn 一个 step（如果 stepwise）或者整个 cot（如果 not stepwise）， 每个unlearn 都会有 epoch次的反向传播， 每次反向传播后 eval_interval 次评估一次， 每次评估都记录结果。 评估内容包括：unlearn step的概率，整个 cot 的概率，模型在该实例上的表现（正确与否，概率），以及 held-out specificity split 上的表现。 每个样本 unlearn 完后，记录结果，并删除该样本。
-    #TODO： 这里的实现非常粗糙， 直接在外面套了三层循环， 需要改进。
+    lora_config = LoRAConfig(
+        rank=args.lora_rank,
+        alpha=args.lora_alpha,
+        dropout=args.lora_dropout,
+        target_modules=parse_lora_target_modules(args.lora_target_modules),
+    )
+    adapter_manager = attach_lora_adapters(base_model, lora_config)
+    collator = FRCollator(tokenizer, device=device)
+
+    adapter_jobs = []
     n_targets = min(N_unlearn, len(target_subset))
+    skipped_jobs = 0
     for idx, target in enumerate(target_subset[:n_targets]):
-        # Clunky for now
-        n_steps = 1
+      n_steps = 1
+      if args.stepwise:
+        n_steps = len(target['segmented_cot'])
+      if args.max_steps_per_instance > 0:
+        n_steps = min(n_steps, args.max_steps_per_instance)
+
+      for step_idx in range(n_steps):
+        check_id = target['id']
         if args.stepwise:
-          n_steps = len(target['segmented_cot'])
-        if args.max_steps_per_instance > 0:
-          n_steps = min(n_steps, args.max_steps_per_instance)
+          check_id = f"{check_id}_{step_idx}"
+        if check_id in ids:
+          skipped_jobs += 1
+          continue
 
-        for step_idx in range(n_steps):
-        
-          check_id = target['id']
-          if args.stepwise: check_id = f"{check_id}_{step_idx}"
+        dataset = cot_to_otfd(
+            target,
+            cots_train,
+            tokenizer,
+            n=args.retain_n,
+            strategy=args.strategy,
+            stepwise=args.stepwise,
+            step_idx=step_idx,
+            pos=args.pos,
+        )
+        target_count = dataset.num_targets()
+        if target_count <= 2:
+          print("-" * 20)
+          print(f"Skipping {check_id}: too few targets")
+          print("-" * 20)
+          continue
 
-          if check_id in ids: continue
+        adapter_id = make_adapter_id(target, step_idx, args.stepwise)
+        adapter_manager.create_adapter(adapter_id)
+        sequence_length = len(dataset[0][0][0])
+        base_instance_info = {
+            'id': target['id'],
+            'question': target['question'],
+            'step_idx': step_idx,
+            'options': target['options'],
+            'correct': target['correct_letter'],
+            'initial_cot': target['cot'],
+            'initial_cot_probs': target['cot_probs'],
+            'initial_probs': target['nocot_probs'],
+            'prediction': int(np.argmax(target['nocot_probs'])),
+            'cot_prediction': int(np.argmax(target['cot_probs'])),
+            'adapter_id': adapter_id,
+        }
+        if args.stepwise:
+          base_instance_info['cot_step'] = target['segmented_cot'][step_idx]
+          base_instance_info['segmented_cot'] = target['segmented_cot']
 
-          instance_info = {
-              'id': target['id'],
-              'question': target['question'],
-              'step_idx': step_idx,
-              'options': target['options'],
-              'correct': target['correct_letter'],
-              'initial_cot': target['cot'],
-              'initial_cot_probs': target['cot_probs'],
-              'initial_probs': target['nocot_probs'],
-              'prediction': int(np.argmax(target['nocot_probs'])),
-              'cot_prediction': int(np.argmax(target['cot_probs']))
-          }
+        adapter_jobs.append({
+            'adapter_id': adapter_id,
+            'target': target,
+            'step_idx': step_idx,
+            'target_index': idx,
+            'sequence_length': sequence_length,
+            'base_instance_info': base_instance_info,
+            'training_job': AdapterTrainingJob(
+                adapter_id=adapter_id,
+                dataset=dataset,
+                collator=collator,
+                epochs=args.epochs,
+                lr=args.lr,
+                loss_type=args.method,
+                batch_size=args.batch_size,
+                input_pad_value=collator.pad_token_id,
+                metadata={
+                    'target_id': target['id'],
+                    'step_idx': step_idx,
+                    'target_index': idx,
+                    'question': target['question'],
+                },
+            ),
+        })
 
-          if args.stepwise:
-              instance_info['cot_step'] = target['segmented_cot'][step_idx]
-              instance_info['segmented_cot'] = target['segmented_cot']
+    print(f"Pending adapter jobs: {len(adapter_jobs)} (skipped already logged jobs: {skipped_jobs})")
+    if not adapter_jobs:
+      print("No adapter jobs to run.")
+      return
 
-          # Logging: model name, cot source, dataset, strategy, stepwise, lr, seed, correct answer
-          return_dict = unlearn_single(model_id, tokenizer, args, target, step_idx, cots_train, cots_verify, DH, idx)
+    adapter_jobs.sort(key=lambda job: job['sequence_length'])
+    job_group_size = args.adapter_group_size if args.adapter_group_size > 0 else len(adapter_jobs)
+    job_groups = chunk_list(adapter_jobs, job_group_size)
 
-          results = return_dict['unlearning_results']
+    def scheduler_builder(optimizer, total_steps):
+      return get_linear_schedule_with_warmup(
+          optimizer,
+          num_warmup_steps=0,
+          num_training_steps=max(1, total_steps),
+      )
 
-          if results is None:
-              # Too few targets, skipping instance
-              continue
+    trainer = AdapterTrainer(
+        base_model,
+        oracle_model,
+        adapter_manager,
+        scheduler_builder=scheduler_builder,
+    )
 
-          # Log the results
-          instance_info['unlearning_results'] = results
-          if args.mmlu:
-            instance_info['mmlu_results'] = return_dict['mmlu_results']
-          if args.gsm:
-            instance_info['gsm8k_results'] = return_dict['gsm8k_results']
-          store(instance_info, resdir+logfile_name)
-          del instance_info
+    adapter_root = Path(f"v2_outputs/adapters/{args.dataset}/{short_model}/{logfile_name[:-4]}")
+    record_root = Path(f"v2_outputs/adapter_records/{args.dataset}/{short_model}/{logfile_name[:-4]}")
+    adapter_root.mkdir(parents=True, exist_ok=True)
+    record_root.mkdir(parents=True, exist_ok=True)
+
+    eval_results_by_adapter = {job['adapter_id']: {} for job in adapter_jobs}
+    if not args.skip_initial_eval:
+      for job in adapter_jobs:
+        with adapter_manager.activate(job['adapter_id']):
+          eval_results_by_adapter[job['adapter_id']][0] = evaluate(
+              base_model,
+              tokenizer,
+              DH,
+              job['target'],
+              cots_verify,
+              step_idx=job['step_idx'],
+              args=args,
+          )
+
+    def epoch_end_callback(training_job: AdapterTrainingJob, epoch: int):
+      should_eval = (epoch == args.epochs) or ((epoch % args.eval_interval) == 0)
+      if not should_eval:
+        return None
+      job_spec = next(job for job in adapter_jobs if job['adapter_id'] == training_job.adapter_id)
+      result = evaluate(
+          base_model,
+          tokenizer,
+          DH,
+          job_spec['target'],
+          cots_verify,
+          step_idx=job_spec['step_idx'],
+          args=args,
+      )
+      eval_results_by_adapter[training_job.adapter_id][epoch] = result
+      return result
+
+    for group_index, job_group in enumerate(job_groups):
+      print(f"Training adapter group {group_index + 1}/{len(job_groups)} with {len(job_group)} jobs")
+      group_results = trainer.train_jobs(
+          [job['training_job'] for job in job_group],
+          compute_loss,
+          mode="batched",
+          epoch_end_callback=epoch_end_callback,
+      )
+      result_by_adapter = {result['adapter_id']: result for result in group_results}
+
+      for job in job_group:
+        adapter_id = job['adapter_id']
+        adapter_path = adapter_root / f"{adapter_id}.pt"
+        record_path = record_root / f"{adapter_id}.json"
+        metadata = {
+            'base_model_id': model_id,
+            'dataset': args.dataset,
+            'strategy': args.strategy,
+            'stepwise': args.stepwise,
+            'method': args.method,
+            'instance_id': job['target']['id'],
+            'step_idx': job['step_idx'],
+            'target_index': job['target_index'],
+            'question': job['target']['question'],
+        }
+        trainer.save_trained_adapter(adapter_id, adapter_path, metadata=metadata)
+        record = AdapterRecord(
+            base_model_id=model_id,
+            adapter_id=adapter_id,
+            adapter_path=str(adapter_path),
+            metadata=metadata,
+        )
+        with record_path.open('w') as outfile:
+          json.dump(record.to_dict(), outfile, ensure_ascii=False, indent=2)
+
+        instance_info = dict(job['base_instance_info'])
+        instance_info['adapter_record'] = record.to_dict()
+        instance_info['adapter_record_path'] = str(record_path)
+        instance_info['adapter_training_history'] = result_by_adapter[adapter_id]['history']
+        instance_info['unlearning_results'] = eval_results_by_adapter[adapter_id]
+        store(instance_info, resdir + logfile_name)
+
+    del collator, trainer, base_model
+    gc.collect()
+    if torch.cuda.is_available():
+      torch.cuda.empty_cache()
 
 if __name__ == '__main__':
     main()

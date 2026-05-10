@@ -20,6 +20,11 @@ def resolve_device(device_pref="auto"):
 def load_model_and_tokenizer(model_name, half=True, device_pref="auto"):
   trust_remote_code = True
   tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=trust_remote_code)
+  if tokenizer.pad_token is None:
+    if 'Phi' in model_name:
+      tokenizer.pad_token = tokenizer.unk_token
+    else:
+      tokenizer.pad_token = tokenizer.eos_token
   device = resolve_device(device_pref)
 
   load_kwargs = {

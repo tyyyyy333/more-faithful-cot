@@ -31,6 +31,7 @@ def answer_probabilities(model, tokenizer, dh, instance):
                                     pad_token_id=tokenizer.pad_token_id)
     
         # 2.1 obtain letter completion probabilities
+        #TODO： 这里为什么不batch化
         first_token_probs = torch.softmax(answer_output['scores'][0][0], dim=-1)
         letter_probs = first_token_probs[answer_indices]
         predicted_letter_index = torch.argmax(letter_probs).item()
@@ -79,6 +80,7 @@ def letter_completion(model, tokenizer, prompt, N):
                                       pad_token_id=tokenizer.pad_token_id) # , num_return_sequences=10
 
     # 2.1 obtain letter completion probabilities
+    #TODO：这里为什么不取batch化
     first_token_probs = torch.softmax(answer_output['scores'][0][0], dim=-1)
     letter_probs = first_token_probs[answer_indices]
     predicted_letter_index = torch.argmax(letter_probs).item()
@@ -91,17 +93,19 @@ def letter_completion(model, tokenizer, prompt, N):
     
     return letter_probs, predicted_letter_index
 
-def generate_dataset_cots(model_id, tokenizer, dataset_id, temperature, sentencize=True):
+def generate_dataset_cots(model_id, tokenizer, dataset_id, temperature, sentencize=True,
+                          max_instances=250, device_pref='auto'):
     print(f"Generating new CoTs for {model_id}, {dataset_id}, sentencize={sentencize}")
-    model, _ = load_model_and_tokenizer(model_id)
+    model, _ = load_model_and_tokenizer(model_id, device_pref=device_pref)
     DH = DATASETS[dataset_id]
     _, valid, test = DH.get_dataset_splits()
     if dataset_id == 'sqa': test = valid # SQA test doesn't have answers
 
     instance_info = []
     
+    #TODO： 这里可以考虑batch化加速， 但是需要注意每个instance的CoT可能长度不一样， 以及每个instance的选项数量不一样， 可能需要padding或者分开处理
     for idx, instance in tqdm(enumerate(test)): # only take 250 instances from each dataset for comparability
-        if idx >= 250: break # 250 _nocot
+        if idx >= max_instances: break
         _, nocot_probs, _ = answer_probabilities(
             model, tokenizer, DH, instance)
 
@@ -148,6 +152,7 @@ def generation_fixed_cot(model, tokenizer, dh, instance, cot_text):
                                       pad_token_id=tokenizer.pad_token_id)
 
     # 2.1 obtain letter completion probabilities
+    #TODO：这里为什么不取batch化
     first_token_probs = torch.softmax(answer_output['scores'][0][0], dim=-1)
     letter_probs = first_token_probs[answer_indices]
     predicted_letter_index = torch.argmax(letter_probs).item()
@@ -298,6 +303,8 @@ def completion_probabilities(model, tokenizer, prefix, targets):
     target_probs = target_probs.squeeze(1)
     seq_probs = torch.sum(target_probs, dim=1)  # prod if not in logspace
     length_penalty = model.generation_config.length_penalty
+    if length_penalty is None:
+        length_penalty = 1.0
     seq_probs /= lengths**length_penalty # if not logspace seq_probs /= lengths
 
     return seq_probs

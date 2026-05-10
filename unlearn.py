@@ -16,6 +16,7 @@ from evaluate import completion_probabilities, answer_probabilities, complete, g
 from data import FRCollator, cot_to_otfd, model_name_dict, load_or_generate_dataset_cots
 from dataload import DATASETS
 from util import set_random_seed
+from models import resolve_device
 
 def memory_stats():
     print(torch.cuda.memory_allocated()/1024**2)
@@ -62,6 +63,7 @@ def get_batch_loss(output, labels):
 
     return loss
 
+#TODO: 可能可以优化
 def compute_loss(model, oracle_model, inputs, loss_type='npo_grad_diff', ref_policy='fine_tuned', beta=0.1, npo_coeff=1.0, grad_diff_coeff=1.0, KL_coeff=1.0, return_outputs=False):
         ### Implement the NPO
         if loss_type == 'npo':
@@ -137,6 +139,7 @@ def compute_loss(model, oracle_model, inputs, loss_type='npo_grad_diff', ref_pol
 
         return (loss, outputs) if return_outputs else loss
 
+
 def compute_specificity(model, tokenizer, DH, specificity_split):
   specificity = []
   specificity_probs = []
@@ -147,8 +150,10 @@ def compute_specificity(model, tokenizer, DH, specificity_split):
   
   return specificity, specificity_probs
 
-def evaluate(model, tokenizer, DH, target, specificity_split, step_idx):
+def evaluate(model, tokenizer, DH, target, specificity_split, step_idx, args=None):
   model.eval()
+  skip_specificity = bool(args and args.skip_specificity)
+  skip_new_cot = bool(args and args.skip_new_cot)
   # (0) efficacy: how does the probability of the initial CoT change after unlearning
   # model, tokenizer, prefix, target
   unlearned_cot = target['cot']
@@ -164,20 +169,27 @@ def evaluate(model, tokenizer, DH, target, specificity_split, step_idx):
   else:
       unlearned_step_prefix = cot_prefix # First cot step
 
-  step_probability = completion_probabilities(model, tokenizer, unlearned_step_prefix, [unlearned_cot])
+  # Measure the probability of the targeted step itself, not the whole CoT.
+  step_probability = completion_probabilities(model, tokenizer, unlearned_step_prefix, [unlearned_step])
 
   # (1) faithfulness: how does the model perform wrt. unlearning target
   completion_after, probs_after, prediction_after = answer_probabilities(
   model, tokenizer, DH, target['raw_instance']) # question_prefix
 
   # (2) "specificity": currently, checks how the model performs on a heldout set of instances from the same dataset: (a) pred, (b) prob
-  specificity_predictions, specificity_probabilities = compute_specificity(model, tokenizer, DH, specificity_split)
+  specificity_predictions, specificity_probabilities = [], []
+  if not skip_specificity:
+      specificity_predictions, specificity_probabilities = compute_specificity(model, tokenizer, DH, specificity_split)
 
   # (3) new CoT: check how the model generated CoT looks like after unlearning
-  new_cot = complete(model, tokenizer, DH.make_cot_prompt(target['raw_instance']))
+  new_cot = ""
+  new_cot_probs = []
+  if not skip_new_cot:
+      new_cot = complete(model, tokenizer, DH.make_cot_prompt(target['raw_instance']))
 
   # (4) probability under new CoT (agreement before/after unlearning)
-  new_cot_probs, _  = generation_fixed_cot(model, tokenizer, DH, target['raw_instance'], new_cot)
+  if not skip_new_cot:
+      new_cot_probs, _  = generation_fixed_cot(model, tokenizer, DH, target['raw_instance'], new_cot)
 
   return_dict = {
       'completion': completion_after,
@@ -191,7 +203,7 @@ def evaluate(model, tokenizer, DH, target, specificity_split, step_idx):
       'specificity_probs': specificity_probabilities,
       
       'new_cot': new_cot,
-      'new_cot_probs': new_cot_probs.tolist(),
+      'new_cot_probs': new_cot_probs.tolist() if hasattr(new_cot_probs, "tolist") else new_cot_probs,
 
       'cot_prob': cot_probability.detach().cpu().float().numpy().tolist(),
       'cot_step_prob': step_probability.detach().cpu().float().numpy().tolist(),
@@ -199,23 +211,35 @@ def evaluate(model, tokenizer, DH, target, specificity_split, step_idx):
 
   return return_dict
 
+
+def load_causal_lm(model_id, device_pref):
+    device = resolve_device(device_pref)
+    load_kwargs = {
+        "trust_remote_code": True,
+    }
+    if device == "cuda":
+        load_kwargs["torch_dtype"] = torch.bfloat16
+        load_kwargs["device_map"] = "auto"
+    else:
+        load_kwargs["torch_dtype"] = torch.float32
+
+    model = CLM.from_pretrained(model_id, **load_kwargs)
+    if device != "cuda":
+        model = model.to(device)
+    return model, torch.device(device)
+
 def unlearn_single(model_id, tokenizer, args, target, step_idx, cots_train, cots_verify, dh, instance_idx):
-
-    # Load models and dataset, fresh every time
-    model = CLM.from_pretrained(model_id, 
-                                torch_dtype=torch.bfloat16,
-                                trust_remote_code=True,
-                                device_map="auto"
-                                )
-    # Oracle model is frozen
-    oracle_model = CLM.from_pretrained(model_id,
-                                        torch_dtype=torch.bfloat16,
-                                        trust_remote_code=True, 
-                                        device_map="auto")
-    device = model.device
-    collator = FRCollator(tokenizer, device=device)
-
-    dataset = cot_to_otfd(target, cots_train, tokenizer, strategy=args.strategy, stepwise=args.stepwise, step_idx=step_idx, pos=args.pos)
+    #stepwise 下， 只产生一个样本， retain这个样本里包含 step_idx 之前的步骤， forget这个样本里包含 step_idx 以及之后的步骤。 full_chain 下， retain样本不包含任何步骤， forget样本包含整个cot。
+    dataset = cot_to_otfd(
+        target,
+        cots_train,
+        tokenizer,
+        n=args.retain_n,
+        strategy=args.strategy,
+        stepwise=args.stepwise,
+        step_idx=step_idx,
+        pos=args.pos,
+    )
 
     NT = dataset.num_targets()
     print(f"Num targets: {NT}")
@@ -226,8 +250,13 @@ def unlearn_single(model_id, tokenizer, args, target, step_idx, cots_train, cots
          print("-"*20)
          return {'unlearning_results': None, 'mmlu_results':None}
 
+    # Load models only after verifying that this step has enough targets.
+    model, device = load_causal_lm(model_id, args.device)
+    oracle_model, _ = load_causal_lm(model_id, args.device)
+    collator = FRCollator(tokenizer, device=device)
+
     EPOCHS = args.epochs
-    batch_size = 1 # cfg.batch_size
+    batch_size = args.batch_size
 
     # For loop for each of the steps in a Cot
     steps_per_epoch = len(dataset) # Unlearning only one statement
@@ -252,7 +281,8 @@ def unlearn_single(model_id, tokenizer, args, target, step_idx, cots_train, cots
 
     results_per_epoch = {}
     # Results before training, for comparison
-    results_per_epoch[0] = evaluate(model, tokenizer, dh, target, cots_verify, step_idx=step_idx)
+    if not args.skip_initial_eval:
+      results_per_epoch[0] = evaluate(model, tokenizer, dh, target, cots_verify, step_idx=step_idx, args=args)
     
     for epoch in range(EPOCHS):
       model.train()
@@ -267,8 +297,13 @@ def unlearn_single(model_id, tokenizer, args, target, step_idx, cots_train, cots
         optimizer.zero_grad()
 
       # Eval step
-      epoch_result = evaluate(model, tokenizer, dh, target, cots_verify,step_idx=step_idx)
-      results_per_epoch[(epoch+1)] = epoch_result
+      should_eval = (
+          (epoch + 1) == EPOCHS or
+          ((epoch + 1) % args.eval_interval == 0)
+      )
+      if should_eval:
+        epoch_result = evaluate(model, tokenizer, dh, target, cots_verify, step_idx=step_idx, args=args)
+        results_per_epoch[(epoch+1)] = epoch_result
 
 
     # So, this is very ugly but I had to do it quickly and it works ¯\_(ツ)_/¯
@@ -287,7 +322,8 @@ def unlearn_single(model_id, tokenizer, args, target, step_idx, cots_train, cots
     # Delete model and clean cuda to free up space for lm eval
     del collator, train_dataloader, dataset, scheduler, optimizer, model, oracle_model
     gc.collect()
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+      torch.cuda.empty_cache()
 
     return_dict = {
         'unlearning_results': results_per_epoch,
@@ -337,11 +373,17 @@ def make_parser():
                         help="Which dataset to use")
     parser.add_argument('--method', type=str, default='npo_KL', 
                         help="Which unlearning method to use")
-    parser.add_argument('--strategy', type=str, default='segmented', 
-                        help="Which unlearning strategy to use: full, segmented")
-    parser.add_argument('--stepwise', action='store_false', help="Unlearn all steps, or one at a time.")
+    parser.add_argument('--strategy', type=str, default='sentencize', 
+                        help="Which unlearning strategy to use: full or sentencize.")
+    parser.add_argument('--stepwise', dest='stepwise', action='store_true',
+                        help="Unlearn one CoT step at a time (default).")
+    parser.add_argument('--full_chain', dest='stepwise', action='store_false',
+                        help="Unlearn the full CoT at once instead of stepwise.")
     parser.add_argument('--temperature', type=float, default=0.,
                         help="Sampling temperature for CoT generation")
+    parser.add_argument('--device', type=str, default='auto',
+                        choices=['auto', 'cpu', 'mps', 'cuda'],
+                        help="Device preference for local smoke tests or GPU runs.")
     parser.add_argument('--seed', type=int, default=1001,
                         help="Random seed for the experiments")
     parser.add_argument('--epochs', type=int, default=5,
@@ -349,11 +391,31 @@ def make_parser():
     parser.add_argument('--lr', type=float, default=5e-5,
                         help="Learning rate for NPO")
     parser.add_argument('--new_cot', action='store_true', help="Force generation of a fresh batch of CoTs.")
+    parser.add_argument('--atomic', action='store_true', help="Use atomic-statement CoTs if available.")
     parser.add_argument('--pos', action='store_true', help="Filter out function tokens in unlearning.")
     parser.add_argument('--ff2', action='store_true', help="Optimize only the ff2 layers")
     parser.add_argument('--ablation', action='store_true', help="Run on subsample of instances, change logging dir.")
     parser.add_argument('--mmlu', type=int, default=0, help="Evaluate MMLU on a subsample of --mmlu model instances post-unlearning")
     parser.add_argument('--gsm', type=int, default=0, help="Evaluate GSM8K on a subsample of --gsm model instances post-unlearning [WIP]")
+    parser.add_argument('--cot_limit', type=int, default=250,
+                        help="Maximum number of CoTs to generate/load for the current run.")
+    parser.add_argument('--verify_size', type=int, default=20,
+                        help="Number of held-out CoT examples used for specificity checks.")
+    parser.add_argument('--retain_n', type=int, default=4,
+                        help="Number of retain CoTs sampled for the unlearning objective.")
+    parser.add_argument('--max_instances', type=int, default=0,
+                        help="If > 0, only run this many training instances.")
+    parser.add_argument('--max_steps_per_instance', type=int, default=0,
+                        help="If > 0, only run up to this many CoT steps per instance.")
+    parser.add_argument('--eval_interval', type=int, default=1,
+                        help="Run evaluation every N epochs and always at the final epoch.")
+    parser.add_argument('--skip_specificity', action='store_true',
+                        help="Skip held-out specificity evaluation for faster runs.")
+    parser.add_argument('--skip_new_cot', action='store_true',
+                        help="Skip post-unlearning CoT generation for faster runs.")
+    parser.add_argument('--skip_initial_eval', action='store_true',
+                        help="Skip epoch-0 evaluation and only evaluate at configured intervals.")
+    parser.set_defaults(stepwise=True)
     
     return parser
 
@@ -366,10 +428,15 @@ def main():
     seed = args.seed
     set_random_seed(seed)
 
-    from huggingface_hub import login
-    login("") # Set your user id
+    hf_token = os.environ.get("HF_TOKEN")
+    if hf_token:
+        try:
+            from huggingface_hub import login
+            login(token=hf_token, add_to_git_credential=False)
+        except Exception as exc:
+            print(f"Warning: Hugging Face login failed, continuing without explicit login: {exc}")
 
-    model_id = args.model_name 
+    model_id = args.model_name
     tokenizer = TOK.from_pretrained(model_id)
 
     # Fix missing pad token if necessary
@@ -389,14 +456,17 @@ def main():
     cot_data = load_or_generate_dataset_cots(model_id=model_id, tokenizer=tokenizer,
                                               dataset_id=args.dataset,force_generate=args.new_cot, 
                                               sentencize=args.strategy == 'sentencize',
-                                              temperature=args.temperature, seed=args.seed, atomic=args.atomic)
+                                              temperature=args.temperature, seed=args.seed,
+                                              atomic=args.atomic, max_instances=args.cot_limit,
+                                              device_pref=args.device)
 
     # Shuffle data
     random.shuffle(cot_data)
 
     # "Specificity" split = same task, different instances
-    N_verify = 20
+    N_verify = min(args.verify_size, max(1, len(cot_data) - 1))
     cots_train, cots_verify = cot_data[:-N_verify], cot_data[-N_verify:] #
+    target_subset = cots_train[:args.max_instances] if args.max_instances > 0 else cots_train
 
     # Results / dataset / model_id
     mod = model_id.split("/")[-1]
@@ -425,14 +495,20 @@ def main():
     ids = load_ids(resdir + logfile_name, stepwise=args.stepwise)
     print(f"Ids so far: {len(ids)}")
 
-    for idx, target in enumerate(cots_train[:N_unlearn]):
+
+    #n_targets 个样本， 每个样本 unlearn 一个 step（如果 stepwise）或者整个 cot（如果 not stepwise）， 每个unlearn 都会有 epoch次的反向传播， 每次反向传播后 eval_interval 次评估一次， 每次评估都记录结果。 评估内容包括：unlearn step的概率，整个 cot 的概率，模型在该实例上的表现（正确与否，概率），以及 held-out specificity split 上的表现。 每个样本 unlearn 完后，记录结果，并删除该样本。
+    #TODO： 这里的实现非常粗糙， 直接在外面套了三层循环， 需要改进。
+    n_targets = min(N_unlearn, len(target_subset))
+    for idx, target in enumerate(target_subset[:n_targets]):
         # Clunky for now
         n_steps = 1
         if args.stepwise:
           n_steps = len(target['segmented_cot'])
+        if args.max_steps_per_instance > 0:
+          n_steps = min(n_steps, args.max_steps_per_instance)
 
         for step_idx in range(n_steps):
-          
+        
           check_id = target['id']
           if args.stepwise: check_id = f"{check_id}_{step_idx}"
 

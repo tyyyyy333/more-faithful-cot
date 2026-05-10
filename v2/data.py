@@ -75,7 +75,7 @@ def left_pad_sequence(vector_list, padding_value):
         ret[i, T-L:] = v_i # Leave padding on left
     return ret
 
-#TODO： 这里似乎没有batch维度， 考虑多条encoder
+# Single-sample fallback kept for POS-filtered paths; the main non-POS path is batched in SegmentOTFDataset._preencode_samples.
 def qcot_encoder(tokenizer, question, cot, pos_filter=False, nlp=None):
     question += "\n\n"
     question_tokens = tokenizer.encode(question, add_special_tokens=False, return_tensors='pt')[0]
@@ -172,17 +172,49 @@ class SegmentOTFDataset(Dataset):
 
     def _preencode_samples(self, samples):
         encoded_samples = []
-        for sample in samples:
-            prompt = self._build_prompt(sample)
+        prompts = [self._build_prompt(sample) for sample in samples]
+        completions = [sample['completion'] for sample in samples]
+
+        if not self.pos_filter:
+            question_tokens_batch = self.tokenizer(
+                [prompt + "\n\n" for prompt in prompts],
+                add_special_tokens=False,
+            )["input_ids"]
+            cot_tokens_batch = self.tokenizer(
+                completions,
+                add_special_tokens=False,
+            )["input_ids"]
+
+            for prompt, completion, question_tokens, cot_tokens in zip(
+                prompts,
+                completions,
+                question_tokens_batch,
+                cot_tokens_batch,
+            ):
+                question_tensor = torch.tensor(question_tokens, dtype=torch.long)
+                cot_tensor = torch.tensor(cot_tokens, dtype=torch.long)
+                encoded_input = torch.cat((question_tensor, cot_tensor), dim=0)
+                labels = encoded_input.clone()
+                labels[:len(question_tensor)] = IGNORE_IDX
+                attention_mask = torch.ones_like(encoded_input)
+                target_count = int(len(cot_tensor))
+                encoded_samples.append({
+                    'bookkeeping': prompt + "\nTarget:" + completion,
+                    'encoded': (encoded_input, labels, attention_mask),
+                    'target_count': target_count,
+                })
+            return encoded_samples
+
+        for prompt, completion in zip(prompts, completions):
             encoded_input, labels, attention_mask, target_count = qcot_encoder(
                 self.tokenizer,
                 prompt,
-                sample['completion'],
+                completion,
                 pos_filter=self.pos_filter,
                 nlp=self.NLP,
             )
             encoded_samples.append({
-                'bookkeeping': prompt + "\nTarget:" + sample['completion'],
+                'bookkeeping': prompt + "\nTarget:" + completion,
                 'encoded': (encoded_input, labels, attention_mask),
                 'target_count': int(target_count.item() if torch.is_tensor(target_count) else target_count),
             })

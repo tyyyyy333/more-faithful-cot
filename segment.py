@@ -30,15 +30,18 @@ WHITESPACE_CHARS = {
     'microsoft/Phi-3-mini-4k-instruct': '▁',
     'mistralai/Mistral-7B-Instruct-v0.2': '▁',
     'meta-llama/Llama-3.2-3B-Instruct': 'Ġ',
+    'Qwen/Qwen2.5-0.5B-Instruct': 'Ġ',
 }
 
 def sentencize(text):
     return nltk.sent_tokenize(text)
 
 def pos_tag(text, nlp):
+    # 词性标注
     doc = nlp(text)
     return [(w.text, w.pos_) for w in doc]
 
+#TODO： 这里对齐可以改成多条encoder并行， 目前是单条encoder逐步对齐
 def words_to_token_spans(wpos, tokens, W):
     # Filter out space tokens
     toks_pos = [(t, p) for t, p in wpos if p != "SPACE"]

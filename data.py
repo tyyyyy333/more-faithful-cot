@@ -15,11 +15,13 @@ from segment import align_cot_to_pos
 
 
 IGNORE_IDX = -100
+_SPACY_NLP = None
 
 model_name_dict = {
     'Phi-3-mini-4k-instruct': 'Phi-3',
     'Meta-Llama-3-8B-Instruct': 'LLaMA-3',
     'Llama-3.2-3B-Instruct': 'LLaMA-3-3B',
+    'Qwen2.5-0.5B-Instruct': 'Qwen-0.5B',
     'Meta-Llama-3-70B-Instruct': 'LLaMA-3-70B',
     'Mistral-7B-Instruct-v0.2': 'Mistral-2',
     'phi-2': 'Phi-2',
@@ -28,22 +30,34 @@ model_name_dict = {
     'Mistral-7B-Instruct-v0.1': 'Mistral-1',
 }
 
-def cache_cots(dataset_cots, root, model_id, dataset_id, seed, temp):
-  floc = f"{root}/{dataset_id}/{model_id}_s={seed}_t={temp}_cots.jsonl"
+def cache_cots(dataset_cots, root, model_id, dataset_id, seed, temp, max_instances=250):
+  limit_tag = "" if max_instances == 250 else f"_n={max_instances}"
+  floc = f"{root}/{dataset_id}/{model_id}_s={seed}_t={temp}{limit_tag}_cots.jsonl"
   dir = f"{root}/{dataset_id}"
   os.makedirs(dir, exist_ok=True)
   with open(floc, 'w') as outfile:
     for line in dataset_cots:
       outfile.write(json.dumps(line) + "\n")
 
-def load_or_generate_dataset_cots(model_id, tokenizer, dataset_id, seed, temperature, force_generate=False, sentencize=True, atomic=False):
+def load_or_generate_dataset_cots(model_id, tokenizer, dataset_id, seed, temperature,
+                                  force_generate=False, sentencize=True, atomic=False,
+                                  max_instances=250, device_pref='auto'):
     root = 'final_cot' if not atomic else 'atomic_cot'
     temp = f"{temperature:.{2}}"
     short_model_id = model_id.split("/")[-1]
-    floc = f"{root}/{dataset_id}/{short_model_id}_s={seed}_t={temp}_cots.jsonl"
+    limit_tag = "" if max_instances == 250 else f"_n={max_instances}"
+    floc = f"{root}/{dataset_id}/{short_model_id}_s={seed}_t={temp}{limit_tag}_cots.jsonl"
     if not os.path.exists(floc) or force_generate:
-        dataset_cots = generate_dataset_cots(model_id, tokenizer, dataset_id, temperature=temperature, sentencize=sentencize)
-        cache_cots(dataset_cots, root,  short_model_id, dataset_id, seed, temp)
+        dataset_cots = generate_dataset_cots(
+            model_id,
+            tokenizer,
+            dataset_id,
+            temperature=temperature,
+            sentencize=sentencize,
+            max_instances=max_instances,
+            device_pref=device_pref,
+        )
+        cache_cots(dataset_cots, root, short_model_id, dataset_id, seed, temp, max_instances=max_instances)
         # Store dependent on seed/temperature
         return dataset_cots
     else:
@@ -61,7 +75,7 @@ def left_pad_sequence(vector_list, padding_value):
         ret[i, T-L:] = v_i # Leave padding on left
     return ret
 
-
+#TODO： 这里似乎没有batch维度， 考虑多条encoder
 def qcot_encoder(tokenizer, question, cot, pos_filter=False, nlp=None):
     question += "\n\n"
     question_tokens = tokenizer.encode(question, add_special_tokens=False, return_tensors='pt')[0]
@@ -80,7 +94,9 @@ def qcot_encoder(tokenizer, question, cot, pos_filter=False, nlp=None):
 
     # Do not unlearn the question, only the CoT
     QL = len(question_tokens)
+    #TODO： 向量化加速
     for i in range(QL): labels[i] = IGNORE_IDX
+    
     if pos_filter:
       for w in word_to_span:
         if not w.is_content():
@@ -121,7 +137,10 @@ class SegmentOTFDataset(Dataset):
         self.pos_filter = pos_filter
         self.NLP = None
         if pos_filter:
-            self.NLP = spacy.load("en_core_web_sm", disable=['ner'])
+            global _SPACY_NLP
+            if _SPACY_NLP is None:
+                _SPACY_NLP = spacy.load("en_core_web_sm", disable=['ner'])
+            self.NLP = _SPACY_NLP
 
         self._forget_sample = None
         self._retain_sample = None
@@ -161,6 +180,7 @@ class SegmentOTFDataset(Dataset):
         (E_f, L_f, A_f, T_f) = qcot_encoder(self.tokenizer, prompt, forget_sample['completion'], pos_filter=self.pos_filter, nlp=self.NLP)
 
         # 2. Take a sufficiently long enough (random?) retain sample
+        #TODO： 这里应该可以shuffle一下
         N_retain = len(self.retain) 
         found_retain = False
         print(f"Looking for a retain sample, idx={idx}")
@@ -177,6 +197,8 @@ class SegmentOTFDataset(Dataset):
           
           self._retain_sample = retain_prompt + "\nTarget:" + retain_sample['completion']
           (E_r, L_r, A_r, T_l) = qcot_encoder(self.tokenizer, retain_prompt, retain_sample['completion'], pos_filter=self.pos_filter, nlp=self.NLP) # Maybe don't use a CoT sample here (~demonstration)
+          
+          #TODO： 如果T_L是completion的token数量，那么min_targets的条件是不是太宽松了？如果completion的token数量很少，那么retain_sample的长度可能很短，导致无法满足min_targets的条件
           if T_l > self.min_targets:
               found_retain = True
               print(f"Using sample #{cur_retain_idx}, N={T_l}") # \n{retain_sample}
@@ -295,7 +317,7 @@ def cot_to_otfd(target, all, tokenizer, n=4, strategy='full', stepwise=True, ste
         
         target = make_targets(target)
 
-        retain = random.sample(all, n)
+        retain = random.sample(all, min(n, len(all)))
         # Format into dict for segment dataset by transforming content into prompt & completion
         retain = [rr for r in retain for rr in make_targets(r)]
 
@@ -316,7 +338,7 @@ def cot_to_otfd(target, all, tokenizer, n=4, strategy='full', stepwise=True, ste
 
         targets = make_targets(target, segment=segment)
 
-        retain = random.sample(all, n)
+        retain = random.sample(all, min(n, len(all)))
         # Format into dict for segment dataset by transforming content into prompt & completion
         retain = [rr for r in retain for rr in make_targets(r, segment=segment)]
 
