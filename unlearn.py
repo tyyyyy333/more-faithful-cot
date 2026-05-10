@@ -403,6 +403,8 @@ def make_parser():
                         help="Number of held-out CoT examples used for specificity checks.")
     parser.add_argument('--retain_n', type=int, default=4,
                         help="Number of retain CoTs sampled for the unlearning objective.")
+    parser.add_argument('--batch_size', type=int, default=1,
+                        help="Training batch size for the unlearning dataloader.")
     parser.add_argument('--max_instances', type=int, default=0,
                         help="If > 0, only run this many training instances.")
     parser.add_argument('--max_steps_per_instance', type=int, default=0,
