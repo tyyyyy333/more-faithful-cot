@@ -173,6 +173,9 @@ class SegmentOTFDataset(Dataset):
 
     def _preencode_samples(self, samples):
         encoded_samples = []
+        if not samples:
+            return encoded_samples
+
         prompts = [self._build_prompt(sample) for sample in samples]
         completions = [sample['completion'] for sample in samples]
 
@@ -227,6 +230,9 @@ class SegmentOTFDataset(Dataset):
             if self._encoded_retain[cur_retain_idx]['target_count'] > self.min_targets:
                 return cur_retain_idx
         return None
+
+    def has_valid_retain(self):
+        return self._selected_retain_idx is not None
 
     def __getitem__(self, idx):
         idx = self.step if self.stepwise else idx

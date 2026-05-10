@@ -9,4 +9,5 @@ results/
 # Local experiment outputs
 final_cot/
 final_results/
+v2_outputs/
 reproduction/

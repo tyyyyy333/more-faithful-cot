@@ -437,7 +437,7 @@ def load_ids(fin, stepwise=False):
       with open(fin, 'r') as infile:
           for line in infile:
               jsonline = json.loads(line)
-              id = jsonline['question']
+              id = jsonline.get('id', jsonline['question'])
               if stepwise:
                   id = f"{id}_{jsonline['step_idx']}"
               ids.add(id)
@@ -446,6 +446,39 @@ def load_ids(fin, stepwise=False):
 def store(instance_info, fout):
     with open(fout, 'a') as outfile:
       outfile.write(json.dumps(instance_info)+"\n")
+
+
+def load_adapter_index_from_results(fin):
+    adapter_index = {}
+    if not os.path.exists(fin):
+      return []
+    with open(fin, 'r') as infile:
+      for line in infile:
+        if not line.strip():
+          continue
+        row = json.loads(line)
+        adapter_id = row.get('adapter_id') or row.get('adapter_record', {}).get('adapter_id')
+        if not adapter_id:
+          continue
+        record_path = row.get('adapter_record_path')
+        record = row.get('adapter_record', {})
+        metadata = record.get('metadata', {})
+        adapter_index[adapter_id] = {
+            'adapter_id': adapter_id,
+            'record_path': Path(record_path).name if record_path else f"{adapter_id}.json",
+            'adapter_path': record.get('adapter_path', ''),
+            'instance_id': row.get('id') or metadata.get('instance_id'),
+            'step_idx': row.get('step_idx', metadata.get('step_idx')),
+            'target_index': metadata.get('target_index'),
+        }
+    return sorted(
+        adapter_index.values(),
+        key=lambda item: (
+            item['target_index'] if item['target_index'] is not None else 10**9,
+            item['step_idx'] if item['step_idx'] is not None else 10**9,
+            item['adapter_id'],
+        ),
+    )
 
 
 def parse_lora_target_modules(raw_value: str) -> tuple[str, ...]:
@@ -512,6 +545,8 @@ def make_parser():
                         help="Number of held-out CoT examples used for specificity checks.")
     parser.add_argument('--retain_n', type=int, default=4,
                         help="Number of retain CoTs sampled for the unlearning objective.")
+    parser.add_argument('--batch_size', type=int, default=1,
+                        help="Training batch size for the unlearning dataloader.")
     parser.add_argument('--max_instances', type=int, default=0,
                         help="If > 0, only run this many training instances.")
     parser.add_argument('--max_steps_per_instance', type=int, default=0,
@@ -661,6 +696,12 @@ def main():
             step_idx=step_idx,
             pos=args.pos,
         )
+        if hasattr(dataset, "has_valid_retain") and not dataset.has_valid_retain():
+          print("-" * 20)
+          print(f"Skipping {check_id}: no retain samples; increase --cot_limit or lower --verify_size")
+          print("-" * 20)
+          continue
+
         target_count = dataset.num_targets()
         if target_count <= 2:
           print("-" * 20)
@@ -714,8 +755,38 @@ def main():
         })
 
     print(f"Pending adapter jobs: {len(adapter_jobs)} (skipped already logged jobs: {skipped_jobs})")
+
+    adapter_root = Path(f"v2_outputs/adapters/{args.dataset}/{short_model}/{logfile_name[:-4]}")
+    record_root = Path(f"v2_outputs/adapter_records/{args.dataset}/{short_model}/{logfile_name[:-4]}")
+    adapter_root.mkdir(parents=True, exist_ok=True)
+    record_root.mkdir(parents=True, exist_ok=True)
+    run_manifest_path = record_root / "run_manifest.json"
+    adapter_index = load_adapter_index_from_results(resdir + logfile_name)
+
+    def write_run_manifest():
+      with run_manifest_path.open('w') as outfile:
+        json.dump({
+            'base_model_id': model_id,
+            'dataset': args.dataset,
+            'strategy': args.strategy,
+            'stepwise': args.stepwise,
+            'method': args.method,
+            'epochs': args.epochs,
+            'lr': args.lr,
+            'batch_size': args.batch_size,
+            'adapter_group_size': args.adapter_group_size,
+            'lora': {
+                'rank': args.lora_rank,
+                'alpha': args.lora_alpha,
+                'dropout': args.lora_dropout,
+                'target_modules': list(parse_lora_target_modules(args.lora_target_modules)),
+            },
+            'adapters': adapter_index,
+        }, outfile, ensure_ascii=False, indent=2)
+
     if not adapter_jobs:
       print("No adapter jobs to run.")
+      write_run_manifest()
       return
 
     adapter_jobs.sort(key=lambda job: job['sequence_length'])
@@ -736,14 +807,7 @@ def main():
         scheduler_builder=scheduler_builder,
     )
 
-    adapter_root = Path(f"v2_outputs/adapters/{args.dataset}/{short_model}/{logfile_name[:-4]}")
-    record_root = Path(f"v2_outputs/adapter_records/{args.dataset}/{short_model}/{logfile_name[:-4]}")
-    adapter_root.mkdir(parents=True, exist_ok=True)
-    record_root.mkdir(parents=True, exist_ok=True)
-    run_manifest_path = record_root / "run_manifest.json"
-
     eval_results_by_adapter = {job['adapter_id']: {} for job in adapter_jobs}
-    adapter_index = []
     if not args.skip_initial_eval:
       for job in adapter_jobs:
         with adapter_manager.activate(job['adapter_id']):
@@ -825,25 +889,7 @@ def main():
         instance_info['unlearning_results'] = eval_results_by_adapter[adapter_id]
         store(instance_info, resdir + logfile_name)
 
-    with run_manifest_path.open('w') as outfile:
-      json.dump({
-          'base_model_id': model_id,
-          'dataset': args.dataset,
-          'strategy': args.strategy,
-          'stepwise': args.stepwise,
-          'method': args.method,
-          'epochs': args.epochs,
-          'lr': args.lr,
-          'batch_size': args.batch_size,
-          'adapter_group_size': args.adapter_group_size,
-          'lora': {
-              'rank': args.lora_rank,
-              'alpha': args.lora_alpha,
-              'dropout': args.lora_dropout,
-              'target_modules': list(parse_lora_target_modules(args.lora_target_modules)),
-          },
-          'adapters': adapter_index,
-      }, outfile, ensure_ascii=False, indent=2)
+    write_run_manifest()
 
     del collator, trainer, base_model
     gc.collect()
