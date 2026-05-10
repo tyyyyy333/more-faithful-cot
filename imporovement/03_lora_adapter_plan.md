@@ -14,8 +14,16 @@
 1. 传入一个 base model，返回一个维护多组 LoRA 参数的对象。
 2. 对一批 stepwise 任务，一次性创建多组 adapter。
 3. 训练时不再反复加载庞大的主模型，只在共享 base model 上切换/更新不同 adapter。
-4. 训练结束后保存每个任务对应的 LoRA 参数，并保留任务到 adapter 的映射关系。
-5. 推理/评估时，只需要加载 base model，再挂上指定 adapter。
+4. reference/oracle 行为也尽量复用同一个 base model，通过“停用 adapter”的方式取回原始基座分布，而不是再加载第二份大模型。
+5. 训练结束后保存每个任务对应的 LoRA 参数，并保留任务到 adapter 的映射关系。
+6. 推理/评估时，只需要加载 base model，再挂上指定 adapter。
+
+当前这条实现主线明确对应：
+
+- `stepwise` 任务；
+- 每个 `(instance, step)` 一个独立 adapter。
+
+`full_chain` 不属于这条 LoRA 多 adapter 主线的目标范围。
 
 ## 2. 为什么这比当前方式更治本
 
@@ -85,7 +93,7 @@ LoRA 真正挂载在线性层上，因此需要一个包装层，概念上类似
 
 trainer 负责：
 
-- 接受 base model、oracle model、adapter manager；
+- 接受 base model、reference/oracle handle、adapter manager；
 - 接受一批任务；
 - 为每个任务分配 adapter id；
 - 在训练该任务时只更新当前 adapter；
@@ -96,6 +104,7 @@ trainer 负责：
 - shared-base
 - multi-adapter
 - no repeated base-model loading
+- batched-by-signature grouping
 
 ## 5. 训练任务的数据抽象
 

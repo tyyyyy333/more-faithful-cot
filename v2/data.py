@@ -41,7 +41,7 @@ def cache_cots(dataset_cots, root, model_id, dataset_id, seed, temp, max_instanc
 
 def load_or_generate_dataset_cots(model_id, tokenizer, dataset_id, seed, temperature,
                                   force_generate=False, sentencize=True, atomic=False,
-                                  max_instances=250, device_pref='auto'):
+                                  max_instances=250, device_pref='auto', model=None):
     root = 'final_cot' if not atomic else 'atomic_cot'
     temp = f"{temperature:.{2}}"
     short_model_id = model_id.split("/")[-1]
@@ -56,6 +56,7 @@ def load_or_generate_dataset_cots(model_id, tokenizer, dataset_id, seed, tempera
             sentencize=sentencize,
             max_instances=max_instances,
             device_pref=device_pref,
+            model=model,
         )
         cache_cots(dataset_cots, root, short_model_id, dataset_id, seed, temp, max_instances=max_instances)
         # Store dependent on seed/temperature

@@ -180,7 +180,7 @@ class LoRAAdapterManager:
             wrapped.set_active_adapter(adapter_name)
 
     @contextmanager
-    def activate(self, adapter_name: str | Sequence[Optional[str]]):
+    def activate(self, adapter_name: Optional[str | Sequence[Optional[str]]]):
         previous = self.active_adapter
         self.set_active_adapter(adapter_name)
         try:
@@ -248,4 +248,6 @@ class LoRAAdapterManager:
 
 
 def attach_lora_adapters(model: nn.Module, config: LoRAConfig) -> LoRAAdapterManager:
-    return LoRAAdapterManager(model, config)
+    manager = LoRAAdapterManager(model, config)
+    model._lora_adapter_manager = manager
+    return manager

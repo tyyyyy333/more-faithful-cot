@@ -225,10 +225,35 @@ class AdapterTrainer:
             for job in jobs
         ]
 
+    @staticmethod
+    def _batch_signature(job: AdapterTrainingJob):
+        return (
+            job.epochs,
+            job.lr,
+            job.loss_type,
+            job.batch_size,
+            job.input_pad_value,
+            job.label_pad_value,
+            job.attention_pad_value,
+            type(job.collator),
+        )
+
     def train_jobs(self, jobs: list[AdapterTrainingJob], compute_loss_fn: Callable, mode: str = "sequential",
                    epoch_end_callback: Optional[Callable[[AdapterTrainingJob, int], dict]] = None):
         if mode == "batched":
-            return self.train_job_group_batched(jobs, compute_loss_fn, epoch_end_callback=epoch_end_callback)
+            grouped_jobs = {}
+            for job in jobs:
+                grouped_jobs.setdefault(self._batch_signature(job), []).append(job)
+            results = []
+            for job_group in grouped_jobs.values():
+                results.extend(
+                    self.train_job_group_batched(
+                        job_group,
+                        compute_loss_fn,
+                        epoch_end_callback=epoch_end_callback,
+                    )
+                )
+            return results
         results = []
         for job in jobs:
             results.append(self.train_job(job, compute_loss_fn, epoch_end_callback=epoch_end_callback))

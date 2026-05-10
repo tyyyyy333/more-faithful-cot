@@ -1,4 +1,5 @@
 import os, sys, gc, json, copy, random, argparse, subprocess, shutil
+from contextlib import nullcontext
 from pprint import pprint
 from collections import defaultdict
 from pathlib import Path
@@ -71,6 +72,15 @@ def get_batch_loss(output, labels):
 
     return loss
 
+
+def _oracle_forward_context(model, oracle_model):
+    if oracle_model is not model:
+        return nullcontext()
+    adapter_manager = getattr(model, "_lora_adapter_manager", None)
+    if adapter_manager is None:
+        return nullcontext()
+    return adapter_manager.activate(None)
+
 def compute_loss(model, oracle_model, inputs, loss_type='npo_grad_diff', ref_policy='fine_tuned', beta=0.1, npo_coeff=1.0, grad_diff_coeff=1.0, KL_coeff=1.0, return_outputs=False):
         oracle_cache = _ACTIVE_ORACLE_CACHE
         forget_inputs, retain_inputs = inputs
@@ -84,7 +94,7 @@ def compute_loss(model, oracle_model, inputs, loss_type='npo_grad_diff', ref_pol
         if oracle_cache is not None and 'forget_loss' in oracle_cache:
             forget_loss_oracle = oracle_cache['forget_loss']
         else:
-            with torch.no_grad():
+            with torch.no_grad(), _oracle_forward_context(model, oracle_model):
                 forget_outputs_oracle = oracle_model(
                     input_ids,
                     labels=labels,
@@ -111,7 +121,7 @@ def compute_loss(model, oracle_model, inputs, loss_type='npo_grad_diff', ref_pol
             if oracle_cache is not None and 'retain_log_probs' in oracle_cache:
                 retain_probs = oracle_cache['retain_log_probs']
             else:
-                with torch.no_grad():
+                with torch.no_grad(), _oracle_forward_context(model, oracle_model):
                     retain_outputs = oracle_model(
                         retain_input_ids,
                         labels=retain_labels,
@@ -554,6 +564,8 @@ def main():
     else:
         tokenizer.pad_token = tokenizer.eos_token
 
+    base_model, device = load_causal_lm(model_id, args.device)
+
     # Data loading (needs tokenizer)
     # Question, CoT, Answer
     # Always unlearn either (a) one step of a cot or (b) entire cot, 
@@ -567,7 +579,7 @@ def main():
                                               sentencize=args.strategy == 'sentencize',
                                               temperature=args.temperature, seed=args.seed,
                                               atomic=args.atomic, max_instances=args.cot_limit,
-                                              device_pref=args.device)
+                                              device_pref=args.device, model=base_model)
 
     # Shuffle data
     random.shuffle(cot_data)
@@ -605,16 +617,12 @@ def main():
     print(f"Ids so far: {len(ids)}")
     if args.ff2:
       raise ValueError("FF2-only optimization is incompatible with the multi-adapter LoRA training flow.")
+    if not args.stepwise:
+      raise NotImplementedError("The multi-adapter LoRA flow is defined for stepwise jobs only; full-chain mode is not supported here.")
     if args.mmlu or args.gsm:
       raise NotImplementedError("The multi-adapter LoRA flow does not yet support lm_eval export paths.")
 
-    base_model, device = load_causal_lm(model_id, args.device)
-    oracle_cache_key = (model_id, args.device)
-    if oracle_cache_key in _SHARED_ORACLE_MODELS:
-      oracle_model = _SHARED_ORACLE_MODELS[oracle_cache_key]
-    else:
-      oracle_model, _ = load_causal_lm(model_id, args.device)
-      _SHARED_ORACLE_MODELS[oracle_cache_key] = oracle_model
+    oracle_model = base_model
 
     lora_config = LoRAConfig(
         rank=args.lora_rank,
@@ -732,8 +740,10 @@ def main():
     record_root = Path(f"v2_outputs/adapter_records/{args.dataset}/{short_model}/{logfile_name[:-4]}")
     adapter_root.mkdir(parents=True, exist_ok=True)
     record_root.mkdir(parents=True, exist_ok=True)
+    run_manifest_path = record_root / "run_manifest.json"
 
     eval_results_by_adapter = {job['adapter_id']: {} for job in adapter_jobs}
+    adapter_index = []
     if not args.skip_initial_eval:
       for job in adapter_jobs:
         with adapter_manager.activate(job['adapter_id']):
@@ -778,6 +788,7 @@ def main():
         adapter_id = job['adapter_id']
         adapter_path = adapter_root / f"{adapter_id}.pt"
         record_path = record_root / f"{adapter_id}.json"
+        relative_adapter_path = os.path.relpath(adapter_path, record_root)
         metadata = {
             'base_model_id': model_id,
             'dataset': args.dataset,
@@ -793,11 +804,19 @@ def main():
         record = AdapterRecord(
             base_model_id=model_id,
             adapter_id=adapter_id,
-            adapter_path=str(adapter_path),
+            adapter_path=relative_adapter_path,
             metadata=metadata,
         )
         with record_path.open('w') as outfile:
           json.dump(record.to_dict(), outfile, ensure_ascii=False, indent=2)
+        adapter_index.append({
+            'adapter_id': adapter_id,
+            'record_path': record_path.name,
+            'adapter_path': relative_adapter_path,
+            'instance_id': job['target']['id'],
+            'step_idx': job['step_idx'],
+            'target_index': job['target_index'],
+        })
 
         instance_info = dict(job['base_instance_info'])
         instance_info['adapter_record'] = record.to_dict()
@@ -805,6 +824,26 @@ def main():
         instance_info['adapter_training_history'] = result_by_adapter[adapter_id]['history']
         instance_info['unlearning_results'] = eval_results_by_adapter[adapter_id]
         store(instance_info, resdir + logfile_name)
+
+    with run_manifest_path.open('w') as outfile:
+      json.dump({
+          'base_model_id': model_id,
+          'dataset': args.dataset,
+          'strategy': args.strategy,
+          'stepwise': args.stepwise,
+          'method': args.method,
+          'epochs': args.epochs,
+          'lr': args.lr,
+          'batch_size': args.batch_size,
+          'adapter_group_size': args.adapter_group_size,
+          'lora': {
+              'rank': args.lora_rank,
+              'alpha': args.lora_alpha,
+              'dropout': args.lora_dropout,
+              'target_modules': list(parse_lora_target_modules(args.lora_target_modules)),
+          },
+          'adapters': adapter_index,
+      }, outfile, ensure_ascii=False, indent=2)
 
     del collator, trainer, base_model
     gc.collect()

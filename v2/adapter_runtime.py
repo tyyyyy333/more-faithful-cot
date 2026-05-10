@@ -69,7 +69,7 @@ def _record_from_payload(base_model_id: str | None, adapter_path: str | Path, pa
 
 def _resolve_record_adapter_path(record: AdapterRecord, record_source: Path | None = None) -> AdapterRecord:
     adapter_path = Path(record.adapter_path)
-    if adapter_path.is_absolute() or record_source is None:
+    if adapter_path.is_absolute() or adapter_path.exists() or record_source is None:
         return record
     resolved = record_source.parent / adapter_path
     return AdapterRecord(
@@ -190,6 +190,22 @@ class AdapterRuntime:
         with self.activate(adapter_id):
             return eval_mod.generation_fixed_cot(self.model, self.tokenizer, dh, instance, cot_text)
 
+    def letter_completion(self, adapter_id: str, prompt: str, n_choices: int):
+        with self.activate(adapter_id):
+            return eval_mod.letter_completion(self.model, self.tokenizer, prompt, n_choices)
+
+    def generate_cot(self, adapter_id: str, instance, **kwargs):
+        with self.activate(adapter_id):
+            return eval_mod.generate_cot(self.model, self.tokenizer, instance, **kwargs)
+
+    def cot_generate(self, adapter_id: str, instance, **kwargs):
+        with self.activate(adapter_id):
+            return eval_mod.cot_generate(self.model, self.tokenizer, instance, **kwargs)
+
+    def completion_probabilities(self, adapter_id: str, prefix: str, targets):
+        with self.activate(adapter_id):
+            return eval_mod.completion_probabilities(self.model, self.tokenizer, prefix, targets)
+
 
 def evaluate_record(record_or_path: str | Path | dict[str, Any] | AdapterRecord,
                     DH, target, specificity_split, step_idx, args=None,
@@ -209,3 +225,18 @@ def load_runtime_for_records(records: Iterable[str | Path | dict[str, Any] | Ada
     for record in records[1:]:
         runtime.load_adapter(record)
     return runtime
+
+
+def load_runtime_from_manifest(manifest_path: str | Path, device_pref: str = "auto") -> AdapterRuntime:
+    manifest_path = Path(manifest_path)
+    with manifest_path.open("r") as infile:
+        manifest = json.load(infile)
+    records = []
+    for entry in manifest.get("adapters", []):
+        record_path = Path(entry["record_path"])
+        if not record_path.is_absolute():
+            candidate = manifest_path.parent / record_path
+            if candidate.exists():
+                record_path = candidate
+        records.append(record_path)
+    return load_runtime_for_records(records, device_pref=device_pref)

@@ -106,9 +106,10 @@ def letter_completion(model, tokenizer, prompt, N):
     return batch_letter_probs[0], int(batch_predictions[0])
 
 def generate_dataset_cots(model_id, tokenizer, dataset_id, temperature, sentencize=True,
-                          max_instances=250, device_pref='auto'):
+                          max_instances=250, device_pref='auto', model=None):
     print(f"Generating new CoTs for {model_id}, {dataset_id}, sentencize={sentencize}")
-    model, _ = load_model_and_tokenizer(model_id, device_pref=device_pref)
+    if model is None:
+        model, _ = load_model_and_tokenizer(model_id, device_pref=device_pref)
     DH = DATASETS[dataset_id]
     _, valid, test = DH.get_dataset_splits()
     if dataset_id == 'sqa': test = valid # SQA test doesn't have answers

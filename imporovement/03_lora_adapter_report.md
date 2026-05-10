@@ -38,7 +38,7 @@
 - `AdapterTrainingJob` 数据结构；
 - trainer 接受：
   - base model
-  - oracle model
+  - reference/oracle handle
   - adapter manager
   - 多个 adapter jobs
 - 支持两类训练方式：
@@ -48,6 +48,8 @@
   - 多个 job 的 batch 会被合并；
   - batch 内不同 sample 会路由到不同 adapter；
   - 多个 adapter 参数在同一个优化器里一起更新。
+- `train_jobs(..., mode="batched")` 会先按训练签名自动分组，再分别做 batched 训练；
+- 因此调用端可以直接交任意数量的 jobs，而不必先自己手工分好完全同构的小批。
 
 此外还已实现：
 
@@ -64,6 +66,7 @@
 当前已实现：
 
 - 当前主入口不再走“每个 step 一个完整模型微调”的旧路径；
+- 当前这条 LoRA 多 adapter 主线明确只支持 `stepwise`；
 - 现在会先展开：
   - `S` 个样本
   - 每个样本 `k_i` 个 step
@@ -82,7 +85,8 @@
 关键点：
 
 - base model 在整轮实验中只加载一次；
-- oracle model 在整轮实验中只加载一次；
+- CoT 预生成路径会复用同一份 base model，不再额外起一份生成模型；
+- reference/oracle 前向不再单独加载第二份大模型，而是复用同一个 base model，在 oracle 前向时临时停用 adapter；
 - 不再为每个 `(instance, step)` 反复加载完整可训练主模型。
 
 ### 1.4 adapter 保存与记录链路
@@ -97,6 +101,7 @@
 - 每个 job 训练完成后，会保存：
   - adapter 参数文件：`v2_outputs/adapters/.../*.pt`
   - adapter 记录文件：`v2_outputs/adapter_records/.../*.json`
+  - run 级索引文件：`v2_outputs/adapter_records/.../run_manifest.json`
 - 记录中包含：
   - `base_model_id`
   - `adapter_id`
@@ -136,6 +141,11 @@
 - 激活该 adapter；
 - 直接跑现有评估函数。
 
+此外当前还支持：
+
+- 从 `run_manifest.json` 一次性恢复同一轮实验下的多组 adapter；
+- record 中的 adapter 路径按 record 所在目录解析，避免恢复时依赖调用目录。
+
 ## 2. 已完成的最小验证
 
 ### 2.1 静态检查
@@ -164,6 +174,11 @@ python3 -m py_compile \
    - trainer 可以驱动多 adapter batch 更新；
    - 训练 history 正常返回。
 
+3. batched trainer 自动分组
+   - 不同训练签名的 toy jobs 可以直接一起交给 `train_jobs(..., mode="batched")`；
+   - trainer 会按签名自动拆组后训练；
+   - 调用端不再需要手工先分组。
+
 ## 3. 当前边界
 
 这条主线已经完成了“架构闭环”，但仍有几个边界需要明确：
@@ -187,6 +202,56 @@ python3 -m py_compile \
 4. batch 内 sample-wise adapter routing；
 5. batched adapter trainer；
 6. adapter-only 存储；
-7. record-based 恢复与评估。
+7. record-based 恢复与评估；
+8. run-manifest-based 批量恢复。
 
 也就是说，核心闭环已经落代码，不再停留在骨架层。
+
+## 5. 总更新日志
+
+这一轮围绕 `stepwise` 的 LoRA 多 adapter 主线，累计完成了以下改造：
+
+1. 新增 `v2/lora_adapter.py`
+   - 实现 `LoRAConfig`、`MultiAdapterLinear`、`LoRAAdapterManager`。
+   - 支持一个 base model 上同时维护多组 adapter。
+   - 支持单 adapter 激活和 batch 内 sample-wise adapter routing。
+   - 支持 adapter state 的保存与加载。
+
+2. 新增 `v2/adapter_trainer.py`
+   - 引入 `AdapterTrainingJob` 抽象。
+   - 实现 `AdapterTrainer`，支持 `sequential` 与 `batched` 两种训练模式。
+   - `batched` 模式下可合并多 job batch，并按 sample 路由不同 adapter。
+   - 进一步支持按训练签名自动分组，调用端不需要手工先拆批。
+
+3. 重写 `v2/unlearn.py` 主入口
+   - LoRA 主线明确限定为 `stepwise`。
+   - 将 `S` 个样本、每个样本的 `k_i` 个 step 展开成 `Sk` 个显式 adapter jobs。
+   - 主模型只加载一次；CoT 预生成复用同一份 base model。
+   - reference/oracle 前向不再依赖第二份大模型，而是通过临时停用 adapter 取得基座分布。
+   - 训练结束后只保存 adapter 参数和对应记录。
+
+4. 完善 adapter 恢复链路
+   - 新增/补全 `v2/adapter_runtime.py`。
+   - 支持从 per-adapter JSON record 恢复 `base model + adapter`。
+   - 支持从 `run_manifest.json` 批量恢复同一轮实验的多组 adapter。
+   - 统一了 record / manifest 中相对路径的保存与解析方式。
+
+5. 打通运行时评估接口
+   - `AdapterRuntime` 现在可直接调用：
+     - `evaluate`
+     - `answer_probabilities`
+     - `letter_completion`
+     - `generate`
+     - `generate_cot`
+     - `cot_generate`
+     - `generation_fixed_cot`
+     - `completion_probabilities`
+
+6. 同步更新数据与评估辅助路径
+   - `v2/data.py` 和 `v2/evaluate.py` 支持在需要生成 CoT 时复用外部传入的 base model。
+   - `v2/models.py` 在 tokenizer 缺少 `pad_token` 时自动补齐，保证恢复后的生成路径一致。
+
+7. 文档同步
+   - 更新 `03_lora_adapter_plan.md`
+   - 更新 `03_lora_adapter_report.md`
+   - 让计划、实现边界、恢复方式、验证结果与当前代码保持一致。
