@@ -56,6 +56,8 @@ NUM_PROCS=4 GPU_IDS=0,1 BATCH_SIZE=8 ADAPTER_GROUP_SIZE=8 \
 
 If this still OOMs, reduce `ADAPTER_GROUP_SIZE` to 4. If GPU utilization is low and there is free memory, increase `ADAPTER_GROUP_SIZE` gradually before increasing `NUM_PROCS`.
 
+By default the v2 runner deletes each adapter checkpoint after its evaluation results have been appended to the final results file. Pass `--keep_adapter_weights` if you need to keep the `.pt` files for later inspection or replay.
+
 Extra arguments are passed through to `v2/unlearn.py`, so a small verification run can be launched with:
 
 ```bash

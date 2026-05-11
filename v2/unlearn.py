@@ -450,6 +450,14 @@ def store(instance_info, fout):
       outfile.write(json.dumps(instance_info)+"\n")
 
 
+def delete_file_if_exists(path: str | Path):
+    path = Path(path)
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+
+
 def load_adapter_index_from_results(fin):
     adapter_index = {}
     if not os.path.exists(fin):
@@ -579,6 +587,8 @@ def make_parser():
                         help="Run only adapter jobs whose global job index maps to this shard.")
     parser.add_argument('--output_suffix', type=str, default="",
                         help="Optional suffix for result, adapter, and record paths. Auto-set for sharded runs.")
+    parser.add_argument('--keep_adapter_weights', action='store_true',
+                        help="Keep adapter checkpoint files on disk instead of deleting them after results are stored.")
     parser.set_defaults(stepwise=True)
     
     return parser
@@ -591,6 +601,7 @@ def main():
       raise ValueError("--job_shard_count must be >= 1")
     if args.job_shard_index < 0 or args.job_shard_index >= args.job_shard_count:
       raise ValueError("--job_shard_index must satisfy 0 <= index < --job_shard_count")
+    delete_adapter_weights = not args.keep_adapter_weights
 
     # Reproducibility
     seed = args.seed
@@ -814,6 +825,7 @@ def main():
             'job_shard_count': args.job_shard_count,
             'job_shard_index': args.job_shard_index,
             'output_suffix': output_suffix,
+            'delete_adapter_weights': delete_adapter_weights,
             'lora': {
                 'rank': args.lora_rank,
                 'alpha': args.lora_alpha,
@@ -930,6 +942,8 @@ def main():
         instance_info['unlearning_results'] = eval_results_by_adapter[adapter_id]
         store(instance_info, resdir + logfile_name)
         adapter_manager.delete_adapter(adapter_id)
+        if delete_adapter_weights:
+            delete_file_if_exists(adapter_path)
 
       if torch.cuda.is_available():
         torch.cuda.empty_cache()
