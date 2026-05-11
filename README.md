@@ -90,6 +90,8 @@ wait
 
 Sharded outputs are automatically separated by suffix. For two shards, result files are written to `v2_outputs/final_results/<dataset>/<model>/*_shard=0-of-2.out` and `*_shard=1-of-2.out`; adapter checkpoints and adapter records use matching suffixed directories under `v2_outputs/adapters/` and `v2_outputs/adapter_records/`.
 
+In stepwise mode, the training unit is one CoT step, not one whole instance. A single instance with N segmented CoT steps creates N adapter jobs and therefore N independent adapters, with adapter ids ending in `_step_0`, `_step_1`, and so on. The sharding logic splits these step-level jobs across processes. Retain examples are pre-encoded once per job, then each dataset access randomly samples one valid retain example instead of always reusing the first valid retain.
+
 ## Paper graphs, result files and analysis notebooks
 
 To recompute results, you need final & ablation result files (`results`,`ablations`) which are too large to share via git. Please send an email to me [\[here\]](mailto:martin.tutek@gmail.com) and I'll share the google drive links with you.

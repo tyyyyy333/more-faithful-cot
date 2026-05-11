@@ -144,10 +144,9 @@ class SegmentOTFDataset(Dataset):
 
         self._forget_sample = None
         self._retain_sample = None
-        self._selected_retain_idx = None
         self._encoded_forget = self._preencode_samples(self.forget)
         self._encoded_retain = self._preencode_samples(self.retain)
-        self._selected_retain_idx = self._find_first_valid_retain_idx()
+        self._valid_retain_indices = self._find_valid_retain_indices()
 
     def __len__(self):
         # If stepwise, we unlearn only one step for each dataset instantiation
@@ -226,24 +225,30 @@ class SegmentOTFDataset(Dataset):
             })
         return encoded_samples
 
-    def _find_first_valid_retain_idx(self):
-        for an_idx in range(len(self._encoded_retain)):
-            cur_retain_idx = (self.retain_idx + an_idx) % len(self._encoded_retain)
-            if self._encoded_retain[cur_retain_idx]['target_count'] > self.min_targets:
-                return cur_retain_idx
-        return None
+    def _find_valid_retain_indices(self):
+        valid_indices = []
+        for retain_idx, encoded_retain in enumerate(self._encoded_retain):
+            if encoded_retain['target_count'] > self.min_targets:
+                valid_indices.append(retain_idx)
+        return valid_indices
+
+    def _sample_retain_idx(self):
+        if not self._valid_retain_indices:
+            return None
+        return random.choice(self._valid_retain_indices)
 
     def has_valid_retain(self):
-        return self._selected_retain_idx is not None
+        return bool(self._valid_retain_indices)
 
     def __getitem__(self, idx):
         idx = self.step if self.stepwise else idx
         forget_sample = self._encoded_forget[idx]
         self._forget_sample = forget_sample['bookkeeping']
 
-        if self._selected_retain_idx is None:
+        retain_idx = self._sample_retain_idx()
+        if retain_idx is None:
             raise ValueError("No long enough retain samples")
-        retain_sample = self._encoded_retain[self._selected_retain_idx]
+        retain_sample = self._encoded_retain[retain_idx]
         self._retain_sample = retain_sample['bookkeeping']
 
         # Padding etc done in collator
