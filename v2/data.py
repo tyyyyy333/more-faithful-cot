@@ -153,13 +153,15 @@ class SegmentOTFDataset(Dataset):
         # If stepwise, we unlearn only one step for each dataset instantiation
         return len(self.forget) if not self.stepwise else 1
 
-    def num_targets(self):
-        print(f"L = {len(self)}")
+    def num_targets(self, verbose=False):
+        if verbose:
+            print(f"L = {len(self)}")
         total_targets = 0
         for idx in range(len(self)):
             cur_idx = self.step if self.stepwise else idx
             total_targets += self._encoded_forget[cur_idx]['target_count']
-            print(total_targets)
+            if verbose:
+                print(total_targets)
         return total_targets
 
     @staticmethod
