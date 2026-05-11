@@ -9,6 +9,64 @@ Main file for running experiments is `unlearn.py`. The NPO method has been adapt
 
 Sample run script: `python unlearn.py --model_name meta-llama/Llama-3.2-3B-Instruct --strategy sentencize --stepwise --dataset sqa --lr 3e-05 --pos --ff2 --method npo_KL`
 
+## v2 adapter reproduction
+
+The v2 runner trains one LoRA adapter per unlearning target/step and writes each adapter plus a JSON record under `v2_outputs/`. For a fast single-GPU smoke test:
+
+```bash
+conda run -n pf-a100 python v2/unlearn.py \
+  --model_name microsoft/Phi-3-mini-4k-instruct \
+  --dataset arc-challenge \
+  --strategy sentencize \
+  --stepwise \
+  --method npo_KL \
+  --epochs 1 \
+  --lr 2e-5 \
+  --cot_limit 16 \
+  --verify_size 2 \
+  --retain_n 4 \
+  --batch_size 1 \
+  --max_instances 1 \
+  --max_steps_per_instance 1 \
+  --eval_interval 1 \
+  --skip_specificity \
+  --skip_new_cot \
+  --skip_initial_eval \
+  --device cuda \
+  --device_map none \
+  --adapter_group_size 1 \
+  --lora_rank 8
+```
+
+For independent multi-GPU adapter training, run one process per GPU. Each process loads its own base model and trains a disjoint shard of adapters; there is no DDP gradient synchronization and no parameter merge between GPUs. Use `--device_map none` so each process keeps its model on the CUDA device exposed by `CUDA_VISIBLE_DEVICES`.
+
+```bash
+COMMON_ARGS="v2/unlearn.py \
+  --model_name microsoft/Phi-3-mini-4k-instruct \
+  --dataset arc-challenge \
+  --strategy sentencize \
+  --stepwise \
+  --method npo_KL \
+  --epochs 5 \
+  --lr 1e-4 \
+  --cot_limit 250 \
+  --verify_size 20 \
+  --retain_n 4 \
+  --batch_size 1 \
+  --eval_interval 1 \
+  --device cuda \
+  --device_map none \
+  --adapter_group_size 2 \
+  --lora_rank 16 \
+  --lora_alpha 32"
+
+CUDA_VISIBLE_DEVICES=0 conda run -n pf-a100 python $COMMON_ARGS --job_shard_count 2 --job_shard_index 0 &
+CUDA_VISIBLE_DEVICES=1 conda run -n pf-a100 python $COMMON_ARGS --job_shard_count 2 --job_shard_index 1 &
+wait
+```
+
+Sharded outputs are automatically separated by suffix. For two shards, result files are written to `v2_outputs/final_results/<dataset>/<model>/*_shard=0-of-2.out` and `*_shard=1-of-2.out`; adapter checkpoints and adapter records use matching suffixed directories under `v2_outputs/adapters/` and `v2_outputs/adapter_records/`.
+
 ## Paper graphs, result files and analysis notebooks
 
 To recompute results, you need final & ablation result files (`results`,`ablations`) which are too large to share via git. Please send an email to me [\[here\]](mailto:martin.tutek@gmail.com) and I'll share the google drive links with you.

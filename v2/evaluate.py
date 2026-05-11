@@ -6,7 +6,7 @@ import numpy as np
 from tqdm import tqdm
 from pprint import pprint
 
-from models import load_model_and_tokenizer
+from models import load_model_and_tokenizer, model_input_device
 from dataload import DATASETS
 
 BOWMAN_HUMAN_ANSWER_PREFIX = "Human: Given all of the above, what's the single, most likely answer?"
@@ -16,7 +16,7 @@ ANSWER_LETTERS = ["A", "B", "C", "D", "E"] # No MCQA dataset considered has more
 
 def _batched_answer_generation(model, tokenizer, prompts, answer_indices,
                                max_new_tokens=10, temperature=0.0, do_sample=False):
-    device = model.device
+    device = model_input_device(model)
     old_padding_side = tokenizer.padding_side
     tokenizer.padding_side = "left"
     answer_inputs = tokenizer(
@@ -71,7 +71,7 @@ def answer_probabilities(model, tokenizer, dh, instance):
 def complete(model, tokenizer, prompt, max_new_tokens=300, temperature=0., do_sample=False, split_newline=True):
   do_sample = temperature > 0. # overwrite
   with torch.no_grad():
-    device = model.device
+    device = model_input_device(model)
     
     inputs = tokenizer.encode(prompt, padding=False, add_special_tokens=False, return_tensors='pt').to(device)
 
@@ -114,7 +114,7 @@ def generate_dataset_cots(model_id, tokenizer, dataset_id, temperature, sentenci
     _, valid, test = DH.get_dataset_splits()
     if dataset_id == 'sqa': test = valid # SQA test doesn't have answers
 
-    device = model.device
+    device = model_input_device(model)
     instances = []
     for idx, instance in enumerate(test):
         if idx >= max_instances:
@@ -319,7 +319,7 @@ def generate_cot(model, tokenizer, instance, max_new_tokens=300, temperature=0.,
     # "Human: Question: {question}\n\nChoices:\n{answer_choices}\n\n"
     LTSBS = "Assistant: Let's think step by step:\n"
 
-    device = model.device
+    device = model_input_device(model)
 
     # 1. Make CoT prompt
     DELIM = "\n\n"
@@ -365,7 +365,7 @@ def cot_generate(model, tokenizer, instance, max_new_tokens=300, temperature=0.,
     return batch_text[0], batch_letter_probs[0], int(batch_predictions[0]), cot_text, cot_prompt
 
 def completion_probabilities(model, tokenizer, prefix, targets):
-    device = model.device
+    device = model_input_device(model)
     prefix_ids = tokenizer(prefix, return_tensors="pt").input_ids.to(device) # [1, T]
     prefix_length = prefix_ids.size(-1)
 

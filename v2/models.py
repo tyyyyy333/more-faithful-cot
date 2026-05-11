@@ -17,7 +17,17 @@ def resolve_device(device_pref="auto"):
   return "cpu"
 
 
-def load_model_and_tokenizer(model_name, half=True, device_pref="auto"):
+def model_input_device(model, fallback_device=None):
+  try:
+    return model.get_input_embeddings().weight.device
+  except Exception:
+    try:
+      return next(model.parameters()).device
+    except StopIteration:
+      return torch.device(fallback_device or "cpu")
+
+
+def load_model_and_tokenizer(model_name, half=True, device_pref="auto", device_map="auto"):
   trust_remote_code = True
   tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=trust_remote_code)
   if tokenizer.pad_token is None:
@@ -30,13 +40,15 @@ def load_model_and_tokenizer(model_name, half=True, device_pref="auto"):
   load_kwargs = {
       "trust_remote_code": trust_remote_code,
   }
+  using_device_map = device == "cuda" and device_map and device_map != "none"
   if device == "cuda":
     load_kwargs["torch_dtype"] = torch.bfloat16
-    load_kwargs["device_map"] = "auto"
+    if using_device_map:
+      load_kwargs["device_map"] = device_map
   else:
     load_kwargs["torch_dtype"] = torch.float32
 
   model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
-  if device != "cuda":
+  if not using_device_map:
     model = model.to(device)
   return model, tokenizer

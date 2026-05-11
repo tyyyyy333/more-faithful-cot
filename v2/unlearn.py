@@ -22,7 +22,7 @@ from adapter_trainer import AdapterTrainer, AdapterTrainingJob
 from adapter_runtime import AdapterRecord
 from lora_adapter import LoRAConfig, attach_lora_adapters
 from util import set_random_seed
-from models import resolve_device
+from models import resolve_device, model_input_device
 
 _ACTIVE_ORACLE_CACHE = None
 _SHARED_ORACLE_MODELS = {}
@@ -158,7 +158,7 @@ def compute_specificity(model, tokenizer, DH, specificity_split):
       return specificity, specificity_probs
 
   batch_size = 8
-  device = model.device
+  device = model_input_device(model)
   n_options = len(DH.get_answer_letters(specificity_split[0]['raw_instance']))
   answer_letters = ["A", "B", "C", "D", "E"][:n_options]
   answer_indices = [tokenizer.encode(letter, add_special_tokens=False)[0] for letter in answer_letters]
@@ -263,21 +263,23 @@ def evaluate(model, tokenizer, DH, target, specificity_split, step_idx, args=Non
   return return_dict
 
 
-def load_causal_lm(model_id, device_pref):
+def load_causal_lm(model_id, device_pref, device_map="auto"):
     device = resolve_device(device_pref)
     load_kwargs = {
         "trust_remote_code": True,
     }
+    using_device_map = device == "cuda" and device_map and device_map != "none"
     if device == "cuda":
         load_kwargs["torch_dtype"] = torch.bfloat16
-        load_kwargs["device_map"] = "auto"
+        if using_device_map:
+            load_kwargs["device_map"] = device_map
     else:
         load_kwargs["torch_dtype"] = torch.float32
 
     model = CLM.from_pretrained(model_id, **load_kwargs)
-    if device != "cuda":
+    if not using_device_map:
         model = model.to(device)
-    return model, torch.device(device)
+    return model, model_input_device(model, torch.device(device))
 
 def unlearn_single(model_id, tokenizer, args, target, step_idx, cots_train, cots_verify, dh, instance_idx):
     global _ACTIVE_ORACLE_CACHE, _SHARED_ORACLE_MODELS
@@ -303,12 +305,12 @@ def unlearn_single(model_id, tokenizer, args, target, step_idx, cots_train, cots
          return {'unlearning_results': None, 'mmlu_results':None}
 
     # Load models only after verifying that this step has enough targets.
-    model, device = load_causal_lm(model_id, args.device)
-    oracle_cache_key = (model_id, args.device)
+    model, device = load_causal_lm(model_id, args.device, args.device_map)
+    oracle_cache_key = (model_id, args.device, args.device_map)
     if oracle_cache_key in _SHARED_ORACLE_MODELS:
       oracle_model = _SHARED_ORACLE_MODELS[oracle_cache_key]
     else:
-      oracle_model, _ = load_causal_lm(model_id, args.device)
+      oracle_model, _ = load_causal_lm(model_id, args.device, args.device_map)
       _SHARED_ORACLE_MODELS[oracle_cache_key] = oracle_model
     collator = FRCollator(tokenizer, device=device)
 
@@ -526,6 +528,8 @@ def make_parser():
     parser.add_argument('--device', type=str, default='auto',
                         choices=['auto', 'cpu', 'mps', 'cuda'],
                         help="Device preference for local smoke tests or GPU runs.")
+    parser.add_argument('--device_map', type=str, default='auto',
+                        help="Hugging Face device_map for CUDA model parallelism. Use 'none' to keep the model on one CUDA device.")
     parser.add_argument('--seed', type=int, default=1001,
                         help="Random seed for the experiments")
     parser.add_argument('--epochs', type=int, default=5,
@@ -569,6 +573,12 @@ def make_parser():
                         help="Comma-separated linear module suffixes to wrap with LoRA. Empty means all linear layers.")
     parser.add_argument('--adapter_group_size', type=int, default=0,
                         help="How many adapter jobs to train together in one batched group. 0 means all jobs.")
+    parser.add_argument('--job_shard_count', type=int, default=1,
+                        help="Split adapter jobs across this many independent processes. 1 disables sharding.")
+    parser.add_argument('--job_shard_index', type=int, default=0,
+                        help="Run only adapter jobs whose global job index maps to this shard.")
+    parser.add_argument('--output_suffix', type=str, default="",
+                        help="Optional suffix for result, adapter, and record paths. Auto-set for sharded runs.")
     parser.set_defaults(stepwise=True)
     
     return parser
@@ -577,6 +587,10 @@ def main():
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
     args = make_parser().parse_args()
+    if args.job_shard_count < 1:
+      raise ValueError("--job_shard_count must be >= 1")
+    if args.job_shard_index < 0 or args.job_shard_index >= args.job_shard_count:
+      raise ValueError("--job_shard_index must satisfy 0 <= index < --job_shard_count")
 
     # Reproducibility
     seed = args.seed
@@ -599,7 +613,7 @@ def main():
     else:
         tokenizer.pad_token = tokenizer.eos_token
 
-    base_model, device = load_causal_lm(model_id, args.device)
+    base_model, device = load_causal_lm(model_id, args.device, args.device_map)
 
     # Data loading (needs tokenizer)
     # Question, CoT, Answer
@@ -646,6 +660,12 @@ def main():
     os.makedirs(resdir, exist_ok=True)
     # No POS, no ff2, unlearn full
     logfile_name = f"{args.method}_{args.strategy}_s={args.stepwise}_lr={str(args.lr)}_rs={args.seed}_pos={args.pos}_ff2={args.ff2}.out"
+    output_suffix = args.output_suffix.strip()
+    if not output_suffix and args.job_shard_count > 1:
+      output_suffix = f"shard={args.job_shard_index}-of-{args.job_shard_count}"
+    if output_suffix:
+      safe_suffix = sanitize_adapter_id(output_suffix)
+      logfile_name = f"{logfile_name[:-4]}_{safe_suffix}.out"
     
     # Restore previous results 
     ids = load_ids(resdir + logfile_name, stepwise=args.stepwise)
@@ -671,6 +691,8 @@ def main():
     adapter_jobs = []
     n_targets = min(N_unlearn, len(target_subset))
     skipped_jobs = 0
+    skipped_shard_jobs = 0
+    global_job_index = 0
     for idx, target in enumerate(target_subset[:n_targets]):
       n_steps = 1
       if args.stepwise:
@@ -679,6 +701,12 @@ def main():
         n_steps = min(n_steps, args.max_steps_per_instance)
 
       for step_idx in range(n_steps):
+        current_job_index = global_job_index
+        global_job_index += 1
+        if (current_job_index % args.job_shard_count) != args.job_shard_index:
+          skipped_shard_jobs += 1
+          continue
+
         check_id = target['id']
         if args.stepwise:
           check_id = f"{check_id}_{step_idx}"
@@ -723,6 +751,7 @@ def main():
             'prediction': int(np.argmax(target['nocot_probs'])),
             'cot_prediction': int(np.argmax(target['cot_probs'])),
             'adapter_id': adapter_id,
+            'global_job_index': current_job_index,
         }
         if args.stepwise:
           base_instance_info['cot_step'] = target['segmented_cot'][step_idx]
@@ -733,6 +762,7 @@ def main():
             'target': target,
             'step_idx': step_idx,
             'target_index': idx,
+            'global_job_index': current_job_index,
             'sequence_length': sequence_length,
             'base_instance_info': base_instance_info,
             'training_job': AdapterTrainingJob(
@@ -748,12 +778,18 @@ def main():
                     'target_id': target['id'],
                     'step_idx': step_idx,
                     'target_index': idx,
+                    'global_job_index': current_job_index,
                     'question': target['question'],
                 },
             ),
         })
 
     print(f"Pending adapter jobs: {len(adapter_jobs)} (skipped already logged jobs: {skipped_jobs})")
+    if args.job_shard_count > 1:
+      print(
+          f"Job shard {args.job_shard_index}/{args.job_shard_count}: "
+          f"kept {len(adapter_jobs)} pending jobs, skipped {skipped_shard_jobs} jobs for other shards"
+      )
 
     adapter_root = Path(f"v2_outputs/adapters/{args.dataset}/{short_model}/{logfile_name[:-4]}")
     record_root = Path(f"v2_outputs/adapter_records/{args.dataset}/{short_model}/{logfile_name[:-4]}")
@@ -774,6 +810,10 @@ def main():
             'lr': args.lr,
             'batch_size': args.batch_size,
             'adapter_group_size': args.adapter_group_size,
+            'device_map': args.device_map,
+            'job_shard_count': args.job_shard_count,
+            'job_shard_index': args.job_shard_index,
+            'output_suffix': output_suffix,
             'lora': {
                 'rank': args.lora_rank,
                 'alpha': args.lora_alpha,
@@ -861,6 +901,7 @@ def main():
             'instance_id': job['target']['id'],
             'step_idx': job['step_idx'],
             'target_index': job['target_index'],
+            'global_job_index': job['global_job_index'],
             'question': job['target']['question'],
         }
         trainer.save_trained_adapter(adapter_id, adapter_path, metadata=metadata)
@@ -879,6 +920,7 @@ def main():
             'instance_id': job['target']['id'],
             'step_idx': job['step_idx'],
             'target_index': job['target_index'],
+            'global_job_index': job['global_job_index'],
         })
 
         instance_info = dict(job['base_instance_info'])
