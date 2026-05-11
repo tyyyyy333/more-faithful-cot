@@ -40,19 +40,21 @@ conda run -n pf-a100 python v2/unlearn.py \
 
 For independent multi-GPU adapter training, run one process per GPU. Each process loads its own base model and trains a disjoint shard of adapters; there is no DDP gradient synchronization and no parameter merge between GPUs. Use `--device_map none` so each process keeps its model on the CUDA device exposed by `CUDA_VISIBLE_DEVICES`.
 
-The helper launcher below starts independent shard processes and writes one log file per shard. On a single 80GB A100, start with 4 processes; on multiple GPUs, set `GPU_IDS` to a comma-separated list and shards are assigned round-robin.
+The helper launcher below starts independent shard processes and writes one log file per shard. On a single 80GB A100, start with 2 processes and `ADAPTER_GROUP_SIZE=8`; 4 processes with rank-16 adapters can OOM because each process keeps its own Phi-3 copy and activation tensors. On multiple GPUs, set `GPU_IDS` to a comma-separated list and shards are assigned round-robin.
 
 ```bash
-NUM_PROCS=4 GPU_IDS=0 BATCH_SIZE=8 ADAPTER_GROUP_SIZE=32 \
+NUM_PROCS=2 GPU_IDS=0 BATCH_SIZE=8 ADAPTER_GROUP_SIZE=8 \
   bash v2/run_sharded_unlearn.sh
 ```
 
 For a two-GPU run:
 
 ```bash
-NUM_PROCS=4 GPU_IDS=0,1 BATCH_SIZE=8 ADAPTER_GROUP_SIZE=32 \
+NUM_PROCS=4 GPU_IDS=0,1 BATCH_SIZE=8 ADAPTER_GROUP_SIZE=8 \
   bash v2/run_sharded_unlearn.sh
 ```
+
+If this still OOMs, reduce `ADAPTER_GROUP_SIZE` to 4. If GPU utilization is low and there is free memory, increase `ADAPTER_GROUP_SIZE` gradually before increasing `NUM_PROCS`.
 
 Extra arguments are passed through to `v2/unlearn.py`, so a small verification run can be launched with:
 
