@@ -710,7 +710,6 @@ def main():
           continue
 
         adapter_id = make_adapter_id(target, step_idx, args.stepwise)
-        adapter_manager.create_adapter(adapter_id)
         sequence_length = len(dataset[0][0][0])
         base_instance_info = {
             'id': target['id'],
@@ -888,6 +887,10 @@ def main():
         instance_info['adapter_training_history'] = result_by_adapter[adapter_id]['history']
         instance_info['unlearning_results'] = eval_results_by_adapter[adapter_id]
         store(instance_info, resdir + logfile_name)
+        adapter_manager.delete_adapter(adapter_id)
+
+      if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     write_run_manifest()
 

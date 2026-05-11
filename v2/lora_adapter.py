@@ -58,6 +58,14 @@ class MultiAdapterLinear(nn.Module):
         self.lora_B[key] = b
         self.scaling[key] = self.config.alpha / max(1, rank)
 
+    def delete_adapter(self, adapter_name: str):
+        key = _sanitize_adapter_name(adapter_name)
+        if key in self.lora_A:
+            del self.lora_A[key]
+        if key in self.lora_B:
+            del self.lora_B[key]
+        self.scaling.pop(key, None)
+
     def set_active_adapter(self, adapter_name: Optional[str | Sequence[Optional[str]]]):
         self.active_adapter = adapter_name
 
@@ -167,6 +175,11 @@ class LoRAAdapterManager:
         self._adapter_names.add(adapter_name)
         for wrapped in self._wrapped_layers.values():
             wrapped.create_adapter(adapter_name)
+
+    def delete_adapter(self, adapter_name: str):
+        self._adapter_names.discard(adapter_name)
+        for wrapped in self._wrapped_layers.values():
+            wrapped.delete_adapter(adapter_name)
 
     def list_adapters(self) -> list[str]:
         return sorted(self._adapter_names)
