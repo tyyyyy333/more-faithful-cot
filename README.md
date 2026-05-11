@@ -40,6 +40,27 @@ conda run -n pf-a100 python v2/unlearn.py \
 
 For independent multi-GPU adapter training, run one process per GPU. Each process loads its own base model and trains a disjoint shard of adapters; there is no DDP gradient synchronization and no parameter merge between GPUs. Use `--device_map none` so each process keeps its model on the CUDA device exposed by `CUDA_VISIBLE_DEVICES`.
 
+The helper launcher below starts independent shard processes and writes one log file per shard. On a single 80GB A100, start with 4 processes; on multiple GPUs, set `GPU_IDS` to a comma-separated list and shards are assigned round-robin.
+
+```bash
+NUM_PROCS=4 GPU_IDS=0 BATCH_SIZE=8 ADAPTER_GROUP_SIZE=32 \
+  bash v2/run_sharded_unlearn.sh
+```
+
+For a two-GPU run:
+
+```bash
+NUM_PROCS=4 GPU_IDS=0,1 BATCH_SIZE=8 ADAPTER_GROUP_SIZE=32 \
+  bash v2/run_sharded_unlearn.sh
+```
+
+Extra arguments are passed through to `v2/unlearn.py`, so a small verification run can be launched with:
+
+```bash
+NUM_PROCS=2 GPU_IDS=0 OUTPUT_PREFIX=verify_2proc \
+  bash v2/run_sharded_unlearn.sh --max_instances 2 --max_steps_per_instance 2
+```
+
 ```bash
 COMMON_ARGS="v2/unlearn.py \
   --model_name microsoft/Phi-3-mini-4k-instruct \
