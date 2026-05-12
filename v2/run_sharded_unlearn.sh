@@ -16,12 +16,16 @@ EPOCHS="${EPOCHS:-5}"
 LR="${LR:-1e-4}"
 COT_LIMIT="${COT_LIMIT:-250}"
 VERIFY_SIZE="${VERIFY_SIZE:-20}"
-RETAIN_N="${RETAIN_N:-8}"
+RETAIN_N="${RETAIN_N:-4}"
 BATCH_SIZE="${BATCH_SIZE:-8}"
 EVAL_INTERVAL="${EVAL_INTERVAL:-5}"
 ADAPTER_GROUP_SIZE="${ADAPTER_GROUP_SIZE:-8}"
 LORA_RANK="${LORA_RANK:-16}"
 LORA_ALPHA="${LORA_ALPHA:-32}"
+POS="${POS:-1}"
+SKIP_INITIAL_EVAL="${SKIP_INITIAL_EVAL:-0}"
+SKIP_SPECIFICITY="${SKIP_SPECIFICITY:-0}"
+SKIP_NEW_COT="${SKIP_NEW_COT:-0}"
 
 IFS=',' read -r -a GPU_ARRAY <<< "$GPU_IDS"
 if [[ "$NUM_PROCS" -lt 1 ]]; then
@@ -49,15 +53,25 @@ common_args=(
   --retain_n "$RETAIN_N"
   --batch_size "$BATCH_SIZE"
   --eval_interval "$EVAL_INTERVAL"
-  --skip_initial_eval
-  --skip_specificity
-  --skip_new_cot
   --device cuda
   --device_map none
   --adapter_group_size "$ADAPTER_GROUP_SIZE"
   --lora_rank "$LORA_RANK"
   --lora_alpha "$LORA_ALPHA"
 )
+
+if [[ "$POS" == "1" ]]; then
+  common_args+=(--pos)
+fi
+if [[ "$SKIP_INITIAL_EVAL" == "1" ]]; then
+  common_args+=(--skip_initial_eval)
+fi
+if [[ "$SKIP_SPECIFICITY" == "1" ]]; then
+  common_args+=(--skip_specificity)
+fi
+if [[ "$SKIP_NEW_COT" == "1" ]]; then
+  common_args+=(--skip_new_cot)
+fi
 
 pids=()
 for ((shard=0; shard<NUM_PROCS; shard++)); do

@@ -56,8 +56,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--method", default="npo_KL", help="Method name used in filenames.")
     parser.add_argument("--run-type", default="sentencize", help="Run type used in filenames.")
     parser.add_argument("--seed", type=int, default=1001, help="Run seed used in filenames.")
-    parser.add_argument("--pos", action="store_true", default=True, help="Expect pos=True in filenames.")
-    parser.add_argument("--ff2", action="store_true", default=True, help="Expect ff2=True in filenames.")
+    parser.add_argument(
+        "--pos",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Expect pos=True in filenames (use --no-pos for pos=False).",
+    )
+    parser.add_argument(
+        "--ff2",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Expect ff2=True in filenames (use --no-ff2 for ff2=False).",
+    )
     return parser
 
 
@@ -94,10 +104,21 @@ def unique_instances(result_dict: list) -> int:
 
 
 def instance_specificity(instance_outputs: dict) -> list:
+    if "0" not in instance_outputs:
+        return []
+
+    baseline = instance_outputs["0"].get("specificity_preds") or []
+    if not baseline:
+        return []
+
     specificity = []
-    initial_predictions = np.array(instance_outputs["0"]["specificity_preds"])
-    for i in range(1, len(instance_outputs)):
-        preds = np.array(instance_outputs[str(i)]["specificity_preds"])
+    initial_predictions = np.array(baseline)
+    for key, value in sorted(instance_outputs.items(), key=lambda t: int(t[0])):
+        if key == "0":
+            continue
+        preds = np.array(value.get("specificity_preds") or [])
+        if len(preds) == 0:
+            continue
         specificity.append(float((initial_predictions == preds).sum() / len(preds) * 100.0))
     return specificity
 
@@ -106,6 +127,8 @@ def compute_specificity(results: list) -> tuple[float, list]:
     spec_through_iters = {}
     for result in results:
         spec = instance_specificity(result["unlearning_results"])
+        if not spec:
+            continue
         for i, value in enumerate(spec):
             spec_through_iters.setdefault(i, []).append(value)
     if not spec_through_iters:
@@ -120,7 +143,16 @@ def average_efficacy(results: list, step: bool = True) -> tuple[float, list]:
     key = "cot_step_prob" if step else "cot_prob"
     for unlearned_step in results:
         unlearning_results = unlearned_step["unlearning_results"]
-        probabilities = [np.exp(r[key][0]) for _, r in sorted(unlearning_results.items(), key=lambda t: int(t[0]))]
+        if "0" not in unlearning_results:
+            continue
+        probabilities = []
+        for _, r in sorted(unlearning_results.items(), key=lambda t: int(t[0])):
+            if key not in r or not r[key]:
+                probabilities = []
+                break
+            probabilities.append(np.exp(r[key][0]))
+        if not probabilities:
+            continue
         p0 = probabilities[0]
         for i, prob in enumerate(probabilities):
             eff_through_iters.setdefault(i, [])
@@ -133,9 +165,18 @@ def average_efficacy(results: list, step: bool = True) -> tuple[float, list]:
 
 
 def instance_changed_prediction(epoch_results: dict) -> tuple[bool, list]:
-    preds = [int(np.argmax(r["probs"])) for _, r in sorted(epoch_results.items(), key=lambda t: int(t[0]))]
-    flips = [pred != preds[0] for pred in preds]
-    return any(flips), flips
+    if "0" in epoch_results:
+        preds = [int(np.argmax(r["probs"])) for _, r in sorted(epoch_results.items(), key=lambda t: int(t[0]))]
+        flips = [pred != preds[0] for pred in preds]
+        return any(flips), flips
+
+    # Fallback for runs that only store the final evaluation.
+    keys = sorted(epoch_results.keys(), key=lambda k: int(k))
+    if not keys:
+        return False, []
+    final_pred = int(np.argmax(epoch_results[keys[-1]]["probs"]))
+    initial_pred = int(epoch_results[keys[-1]].get("prediction", final_pred))
+    return final_pred != initial_pred, [initial_pred != final_pred]
 
 
 def changed_prediction(results: list) -> float:
@@ -168,6 +209,11 @@ def make_filename(method: str, run_type: str, lr: float, seed: int, pos: bool, f
     return f"{method}_{run_type}_s=True_lr={lr}_rs={seed}_pos={pos}_ff2={ff2}.out"
 
 
+def match_result_files(root: Path, method: str, run_type: str, lr: float, seed: int, pos: bool, ff2: bool) -> list[Path]:
+    prefix = f"{method}_{run_type}_s=True_lr={lr}_rs={seed}_pos={pos}_ff2={ff2}"
+    return sorted(root.glob(f"{prefix}*.out"))
+
+
 def traverse_stats(root: Path, method: str, run_type: str, seed: int, pos: bool, ff2: bool) -> tuple[dict, list]:
     extracted_lrs = list_learning_rates(root)
     nested = {}
@@ -176,22 +222,24 @@ def traverse_stats(root: Path, method: str, run_type: str, seed: int, pos: bool,
         for model in MODELS:
             key = f"{dataset}_{model}"
             for lr in extracted_lrs[key]:
-                path = root / dataset / model / make_filename(method, run_type, lr, seed, pos, ff2)
-                if not path.exists():
+                paths = match_result_files(root / dataset / model, method, run_type, lr, seed, pos, ff2)
+                if not paths:
                     continue
-                per_instance_results = load_jsonl(path)
-                if not per_instance_results:
-                    continue
-                nested.setdefault(dataset, {}).setdefault(model, {}).setdefault(method, {})[lr] = make_stats(per_instance_results)
-                flat_rows.append(
-                    {
-                        "dataset": dataset,
-                        "model": model,
-                        "method": method,
-                        "lr": lr,
-                        **nested[dataset][model][method][lr],
-                    }
-                )
+                for path in paths:
+                    per_instance_results = load_jsonl(path)
+                    if not per_instance_results:
+                        continue
+                    nested.setdefault(dataset, {}).setdefault(model, {}).setdefault(method, {})[lr] = make_stats(per_instance_results)
+                    flat_rows.append(
+                        {
+                            "dataset": dataset,
+                            "model": model,
+                            "method": method,
+                            "lr": lr,
+                            "file": path.name,
+                            **nested[dataset][model][method][lr],
+                        }
+                    )
     return nested, flat_rows
 
 
@@ -200,14 +248,13 @@ def load_best_full_results(root: Path, method: str, run_type: str, seed: int, po
     for dataset in DATASETS:
         for model in MODELS:
             lr = BEST_LR[dataset][model]
-            path = root / dataset / model / make_filename(method, run_type, lr, seed, pos, ff2)
-            if not path.exists():
-                continue
-            results = load_jsonl(path)
-            if not results:
-                continue
-            stats = make_stats(results)
-            rows.append({"dataset": dataset, "model": model, "lr": lr, **stats})
+            paths = match_result_files(root / dataset / model, method, run_type, lr, seed, pos, ff2)
+            for path in paths:
+                results = load_jsonl(path)
+                if not results:
+                    continue
+                stats = make_stats(results)
+                rows.append({"dataset": dataset, "model": model, "lr": lr, "file": path.name, **stats})
     return rows
 
 
