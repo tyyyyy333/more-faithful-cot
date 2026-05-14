@@ -15,6 +15,7 @@ from torch.utils.data import DataLoader
 from evaluate import completion_probabilities, answer_probabilities, complete, generation_fixed_cot
 from data import FRCollator, cot_to_otfd, model_name_dict, load_or_generate_dataset_cots
 from dataload import DATASETS
+from mechanistic_diagnostics import maybe_run_mechanistic_diagnostics
 from util import set_random_seed
 from models import resolve_device
 
@@ -191,6 +192,15 @@ def evaluate(model, tokenizer, DH, target, specificity_split, step_idx, args=Non
   if not skip_new_cot:
       new_cot_probs, _  = generation_fixed_cot(model, tokenizer, DH, target['raw_instance'], new_cot)
 
+  mechanistic_diagnostics = maybe_run_mechanistic_diagnostics(
+      model,
+      tokenizer,
+      DH,
+      target,
+      step_idx,
+      args=args,
+  )
+
   return_dict = {
       'completion': completion_after,
       'probs': probs_after.tolist(),
@@ -207,6 +217,7 @@ def evaluate(model, tokenizer, DH, target, specificity_split, step_idx, args=Non
 
       'cot_prob': cot_probability.detach().cpu().float().numpy().tolist(),
       'cot_step_prob': step_probability.detach().cpu().float().numpy().tolist(),
+      'mechanistic_diagnostics': mechanistic_diagnostics,
   }
 
   return return_dict
@@ -415,6 +426,10 @@ def make_parser():
                         help="Skip held-out specificity evaluation for faster runs.")
     parser.add_argument('--skip_new_cot', action='store_true',
                         help="Skip post-unlearning CoT generation for faster runs.")
+    parser.add_argument('--mechanistic_diag', action='store_true',
+                        help="Run pluggable internal-state diagnostics during evaluation.")
+    parser.add_argument('--mechanistic_diag_proj_limit', type=int, default=24,
+                        help="Maximum number of projection/QKV-style modules to summarize during diagnostics.")
     parser.add_argument('--skip_initial_eval', action='store_true',
                         help="Skip epoch-0 evaluation and only evaluate at configured intervals.")
     parser.set_defaults(stepwise=True)

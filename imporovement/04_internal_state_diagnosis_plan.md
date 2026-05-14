@@ -429,3 +429,70 @@
 > 行为评估 + 内部状态比较 + 因果 patching
 
 的联合诊断框架。
+
+---
+
+## 11. 当前接入方案
+
+为了先把机制诊断挂到现有实验流里，当前实现采用的是：
+
+- 新增一个共享模块：
+  - `mechanistic_diagnostics.py`
+- 模块内统一封装三部分：
+  1. hidden-state / residual 表征比较
+  2. answer-to-step attention 依赖摘要
+  3. projection / QKV 风格模块输出摘要
+- 原版 `unlearn.py` 和 `v2/unlearn.py` 都只在 `evaluate()` 阶段按开关调用它
+
+这样做的好处是：
+
+- 不改当前训练逻辑；
+- 不污染 `evaluate.py` 里的原有行为评估 API；
+- 默认关闭，只有显式打开时才增加额外前向与 hook 开销；
+- 原版和 `v2` 共享同一份诊断逻辑，便于横向比较。
+
+### 11.1 当前开关
+
+当前接入的两个参数是：
+
+- `--mechanistic_diag`
+  - 是否在评估阶段运行内部状态诊断
+- `--mechanistic_diag_proj_limit`
+  - 最多摘要多少个 projection / QKV 风格模块
+
+### 11.2 当前返回字段
+
+开启后，评估结果字典中会新增：
+
+- `mechanistic_diagnostics`
+
+其中当前包含：
+
+- `prompt_lengths`
+- `representation`
+  - `step_answer_cosine_by_layer`
+  - `answer_removed_cosine_by_layer`
+  - `answer_norm_by_layer`
+  - `removed_answer_norm_by_layer`
+- `attention`
+  - `answer_to_step_mass_by_layer`
+  - `answer_to_prefix_mass_by_layer`
+  - `answer_to_post_step_mass_by_layer`
+- `projections`
+  - 每个模块的 step/answer 相似度与 removed-step 对比
+- `warnings`
+
+### 11.3 当前版本刻意还没做的事
+
+当前接入版还没有直接实现：
+
+- activation patching
+- probe 训练
+- 多 adapter / 多 epoch trace 离线聚合器
+- 大规模 trace 持久化
+
+原因是这一版先解决：
+
+> 如何以最小侵入方式，把机制诊断稳定挂到原版和 `v2` 的评估阶段
+
+后续再在这个入口之上继续扩展 patching 和 trace 存储。
