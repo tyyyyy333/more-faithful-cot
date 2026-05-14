@@ -496,3 +496,31 @@
 > 如何以最小侵入方式，把机制诊断稳定挂到原版和 `v2` 的评估阶段
 
 后续再在这个入口之上继续扩展 patching 和 trace 存储。
+
+### 11.4 当前已实现状态
+
+目前这条诊断线已经有一版共享实现：
+
+- 共享文件：
+  - `mechanistic_diagnostics.py`
+- 接入位置：
+  - 原版 `unlearn.py` 的 `evaluate()`
+  - `v2/unlearn.py` 的 `evaluate()`
+
+当前已经支持：
+
+- hidden-state / residual 风格的分层表征摘要
+- answer-to-step 的 attention mass 摘要
+- projection/QKV 风格模块输出摘要
+- before/after 的差值、比值、对数比值比较
+- 简单的折线图、柱状图、projection heatmap 可视化函数
+
+当前尚未实现：
+
+- activation patching
+- trace 落盘与离线批量聚合
+- probe 训练
+
+因此这一版的定位是：
+
+> 已经能稳定作为评估阶段的插拔式机制诊断器，但还不是完整的机制分析平台。

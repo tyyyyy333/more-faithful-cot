@@ -590,3 +590,148 @@ L_{\text{first-k NPO}}
 > **稳定的 first-k 行为层忘却 + 层加权的机制约束 + 语义 prototype 扩展**
 
 这三者结合，才最接近“既不只是学会不说，又能训练得动”的目标。
+
+---
+
+## 14. 当前已实现的第一版
+
+目前代码里已经先实现了一个**第一版可插拔机制 loss**，目标是把最容易稳定落地的部分先接到原版和 `v2` 里。
+
+### 14.1 当前实现文件
+
+- 共享模块：
+  - `mechanistic_objectives.py`
+- 接入位置：
+  - 原版 `unlearn.py`
+  - `v2/unlearn.py`
+
+### 14.2 当前已实现的两个部件
+
+#### A. `first-k` forget objective
+
+当前 forget loss 已支持：
+
+- 如果 `forget_k_tokens == 0`
+  - 保持原始 full-step forget 行为
+- 如果 `forget_k_tokens > 0`
+  - 只对目标 step 的前 `k` 个 target token 计算 forget objective
+
+这对应本文件前面讨论的：
+
+- `first-k NPO` 稳定基线
+
+#### B. 层加权 representation similarity penalty
+
+当前已支持一个辅助机制项：
+
+- 对 forget step 的 hidden states
+- 与 reference/oracle 模型在**同一输入**上的 hidden states 做余弦相似度比较
+- 对目标 token 做平均
+- 只取最后若干层
+- 再按 `gamma` 从后往前折扣
+- 最后将该项加回当前 forget loss
+
+也就是说，这一版实现的是：
+
+\[
+L
+=
+L_{\text{forget}}
++
+\lambda_{\text{repr}} L_{\text{repr-sim}}
++
+L_{\text{retain}}
+\]
+
+其中当前 `L_repr-sim` 更接近：
+
+- “别再像原来那样表示这个 step”
+
+而不是更强的：
+
+- “靠近 removed-step 的 counterfactual 表征”
+- 或“远离 forget prototype、靠近 retain prototype”
+
+### 14.3 当前开关
+
+原版和 `v2` 现在都支持以下参数：
+
+- `--forget_k_tokens`
+  - 只对目标 step 的前 `k` 个 token 计算 forget objective
+- `--repr_loss`
+  - 是否开启 representation similarity penalty
+- `--repr_lambda`
+  - 机制项权重
+- `--repr_last_layers`
+  - 取最后多少层做机制项
+- `--repr_gamma`
+  - 分层折扣系数
+- `--repr_k_tokens`
+  - 机制项里只取前 `k` 个 target token
+- `--repr_auto_scale`
+  - 是否按当前 forget loss 尺度自动缩放机制项
+
+### 14.4 当前实现的定位
+
+这一版不是最终推荐主线，而是：
+
+- 可切换
+- 可对照实验
+- 与原 NPO 兼容
+- 工程风险较低
+
+的第一版机制约束实现。
+
+它最接近本文前面保留下来的两点：
+
+1. `first-k` token 稳定 forget
+2. 层加权 hidden-state 机制项
+
+### 14.5 当前还没有实现的内容
+
+本文件中更长期推荐的两条线，目前还没有真正落代码：
+
+1. `counterfactual representation loss`
+   - 也就是把目标从“远离原始表征”升级为“靠近 removed-step 反事实表征”
+
+2. `prototype contrastive loss`
+   - 也就是把单一平均语义向量升级为正负 prototype 对比
+
+因此当前这版应被理解为：
+
+> 第一版工程实现：稳定 baseline + 机制项入口  
+> 而不是最终语义最强的训练目标。
+
+### 14.6 推荐的当前使用方式
+
+如果要给合作者一个清晰的实验入口，当前最值得先跑的三组是：
+
+1. 原始基线
+
+```bash
+--method npo_KL
+```
+
+2. 稳定 forget 基线
+
+```bash
+--method npo_KL --forget_k_tokens 4
+```
+
+3. 稳定 forget + 机制项
+
+```bash
+--method npo_KL \
+--forget_k_tokens 4 \
+--repr_loss \
+--repr_lambda 0.1 \
+--repr_last_layers 4 \
+--repr_gamma 0.9 \
+--repr_auto_scale
+```
+
+这样最容易回答三个问题：
+
+- `first-k` 是否比 full-step 更稳；
+- 只加稳定 forget 是否已经足够；
+- 加上机制项后，行为变化与内部变化是否更一致。

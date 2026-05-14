@@ -28,9 +28,19 @@ _SHARED_ROOT = Path(__file__).resolve().parents[1]
 if str(_SHARED_ROOT) not in sys.path:
     sys.path.append(str(_SHARED_ROOT))
 from mechanistic_diagnostics import maybe_run_mechanistic_diagnostics
+from mechanistic_objectives import get_batch_loss_masked, representation_similarity_loss, scale_auxiliary_loss
 
 _ACTIVE_ORACLE_CACHE = None
 _SHARED_ORACLE_MODELS = {}
+_MECHANISTIC_LOSS_CONFIG = {
+    'forget_k_tokens': 0,
+    'repr_loss': False,
+    'repr_lambda': 0.0,
+    'repr_last_layers': 4,
+    'repr_gamma': 0.9,
+    'repr_k_tokens': 0,
+    'repr_auto_scale': False,
+}
 
 def memory_stats():
     print(torch.cuda.memory_allocated()/1024**2)
@@ -88,15 +98,25 @@ def _oracle_forward_context(model, oracle_model):
 
 def compute_loss(model, oracle_model, inputs, loss_type='npo_grad_diff', ref_policy='fine_tuned', beta=0.1, npo_coeff=1.0, grad_diff_coeff=1.0, KL_coeff=1.0, return_outputs=False):
         oracle_cache = _ACTIVE_ORACLE_CACHE
+        mech = _MECHANISTIC_LOSS_CONFIG
+        forget_k_tokens = mech.get('forget_k_tokens', 0)
+        use_repr_loss = mech.get('repr_loss', False)
+        repr_outputs_flag = bool(use_repr_loss)
         forget_inputs, retain_inputs = inputs
         input_ids, labels, attention_mask = forget_inputs
-        outputs = model(input_ids, labels=labels, attention_mask=attention_mask)
+        outputs = model(
+            input_ids,
+            labels=labels,
+            attention_mask=attention_mask,
+            output_hidden_states=repr_outputs_flag,
+        )
 
         if ref_policy != 'fine_tuned':
             raise NotImplementedError
 
-        forget_loss_current = get_batch_loss(outputs.logits, labels)
-        if oracle_cache is not None and 'forget_loss' in oracle_cache:
+        forget_loss_current = get_batch_loss_masked(outputs.logits, labels, max_target_tokens=forget_k_tokens)
+        use_cached_forget_loss = oracle_cache is not None and 'forget_loss' in oracle_cache and not use_repr_loss
+        if use_cached_forget_loss:
             forget_loss_oracle = oracle_cache['forget_loss']
         else:
             with torch.no_grad(), _oracle_forward_context(model, oracle_model):
@@ -104,11 +124,31 @@ def compute_loss(model, oracle_model, inputs, loss_type='npo_grad_diff', ref_pol
                     input_ids,
                     labels=labels,
                     attention_mask=attention_mask,
+                    output_hidden_states=repr_outputs_flag,
                 )
-            forget_loss_oracle = get_batch_loss(forget_outputs_oracle.logits, labels)
+            forget_loss_oracle = get_batch_loss_masked(
+                forget_outputs_oracle.logits,
+                labels,
+                max_target_tokens=forget_k_tokens,
+            )
 
         neg_log_ratios = forget_loss_current - forget_loss_oracle
         forget_loss = -F.logsigmoid(beta * neg_log_ratios).mean() * 2 / beta
+        if use_repr_loss:
+            repr_loss = representation_similarity_loss(
+                outputs.hidden_states,
+                forget_outputs_oracle.hidden_states,
+                labels,
+                last_n_layers=mech.get('repr_last_layers', 4),
+                gamma=mech.get('repr_gamma', 0.9),
+                max_target_tokens=mech.get('repr_k_tokens', 0),
+            )
+            forget_loss = forget_loss + scale_auxiliary_loss(
+                repr_loss,
+                forget_loss,
+                coeff=mech.get('repr_lambda', 0.0),
+                auto_scale=mech.get('repr_auto_scale', False),
+            )
 
         if loss_type == 'npo':
             loss = forget_loss
@@ -588,6 +628,20 @@ def make_parser():
                         help="Run pluggable internal-state diagnostics during evaluation.")
     parser.add_argument('--mechanistic_diag_proj_limit', type=int, default=24,
                         help="Maximum number of projection/QKV-style modules to summarize during diagnostics.")
+    parser.add_argument('--forget_k_tokens', type=int, default=0,
+                        help="If > 0, only apply the forget objective to the first k target tokens.")
+    parser.add_argument('--repr_loss', action='store_true',
+                        help="Add a layer-weighted representation similarity penalty on the forget step.")
+    parser.add_argument('--repr_lambda', type=float, default=0.0,
+                        help="Weight for the representation similarity penalty.")
+    parser.add_argument('--repr_last_layers', type=int, default=4,
+                        help="Number of final hidden-state layers used in the representation penalty.")
+    parser.add_argument('--repr_gamma', type=float, default=0.9,
+                        help="Backward layer discount for the representation penalty.")
+    parser.add_argument('--repr_k_tokens', type=int, default=0,
+                        help="If > 0, only use the first k target tokens when computing the representation penalty.")
+    parser.add_argument('--repr_auto_scale', action='store_true',
+                        help="Auto-scale the representation penalty to the current forget-loss magnitude.")
     parser.add_argument('--skip_initial_eval', action='store_true',
                         help="Skip epoch-0 evaluation and only evaluate at configured intervals.")
     parser.add_argument('--lora_rank', type=int, default=8,
@@ -616,6 +670,15 @@ def main():
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
     args = make_parser().parse_args()
+    _MECHANISTIC_LOSS_CONFIG.update({
+        'forget_k_tokens': args.forget_k_tokens,
+        'repr_loss': args.repr_loss,
+        'repr_lambda': args.repr_lambda,
+        'repr_last_layers': args.repr_last_layers,
+        'repr_gamma': args.repr_gamma,
+        'repr_k_tokens': args.repr_k_tokens,
+        'repr_auto_scale': args.repr_auto_scale,
+    })
     if args.job_shard_count < 1:
       raise ValueError("--job_shard_count must be >= 1")
     if args.job_shard_index < 0 or args.job_shard_index >= args.job_shard_count:
