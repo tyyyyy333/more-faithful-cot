@@ -1,9 +1,6 @@
 import nltk
 import spacy
 import torch
-import random
-
-import numpy as np
 
 from dataclasses import dataclass
 
@@ -25,14 +22,6 @@ class Word:
     def is_content(self):
       return self.pos in TARGET_TAGS
 
-WHITESPACE_CHARS = {
-    'meta-llama/Meta-Llama-3-8B-Instruct': 'Ġ',
-    'microsoft/Phi-3-mini-4k-instruct': '▁',
-    'mistralai/Mistral-7B-Instruct-v0.2': '▁',
-    'meta-llama/Llama-3.2-3B-Instruct': 'Ġ',
-    'Qwen/Qwen2.5-0.5B-Instruct': 'Ġ',
-}
-
 def sentencize(text):
     return nltk.sent_tokenize(text)
 
@@ -40,6 +29,12 @@ def pos_tag(text, nlp):
     # 词性标注
     doc = nlp(text)
     return [(w.text, w.pos_) for w in doc]
+
+
+def _offsets_overlap(left, right):
+    left_start, left_end = left
+    right_start, right_end = right
+    return left_start < right_end and right_start < left_end
 
 #TODO： 这里对齐可以改成多条encoder并行， 目前是单条encoder逐步对齐
 def words_to_token_spans(wpos, tokens, W):
@@ -88,11 +83,37 @@ def words_to_token_spans(wpos, tokens, W):
 
     return words
 
-def align_cot_to_pos(cot_step_text, tokenizer, model_id, nlp):    
-    W = WHITESPACE_CHARS[model_id]
-    w_p = pos_tag(cot_step_text, nlp)
-    pretokenized_text = [f" {w}" for w,_ in w_p] # Take words, prefix whitespace
-    tokens = tokenizer.tokenize(pretokenized_text, is_split_into_words=True, add_special_tokens=False)
-    indices = torch.tensor(tokenizer.convert_tokens_to_ids(tokens))
+def align_cot_to_pos(cot_step_text, tokenizer, model_id, nlp):
+    del model_id  # Kept in the signature for compatibility with existing callers.
 
-    return indices, words_to_token_spans(w_p, tokens, W)
+    encoded = tokenizer(
+        cot_step_text,
+        add_special_tokens=False,
+        return_offsets_mapping=True,
+    )
+    indices = torch.tensor(encoded["input_ids"])
+    offsets = encoded["offset_mapping"]
+
+    doc = nlp(cot_step_text)
+    words = []
+    for token in doc:
+        if token.pos_ == "SPACE":
+            continue
+        token_span = (token.idx, token.idx + len(token.text))
+        covered_indices = [
+            idx
+            for idx, offset in enumerate(offsets)
+            if offset[0] != offset[1] and _offsets_overlap(offset, token_span)
+        ]
+        if not covered_indices:
+            continue
+        words.append(
+            Word(
+                token.text,
+                token.pos_,
+                min(covered_indices),
+                max(covered_indices) + 1,
+            )
+        )
+
+    return indices, words
