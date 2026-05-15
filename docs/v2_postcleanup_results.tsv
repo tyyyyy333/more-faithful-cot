@@ -1,0 +1,4 @@
+group	files	rows	questions	agree_rows	row_final_ff_hard_pct	question_final_ff_hard_pct	question_any_epoch_ff_hard_pct	agree_question_final_ff_hard_pct	efficacy_mean	specificity_mean	loss_final_mean
+downproj_r32_lr5e4	2	940	230	852	4.681	12.609	13.043	10.096	68.927	99.995	1.399
+alllinear_lr3e4	2	940	230	852	11.383	26.957	26.957	24.038	89.924	99.851	0.219
+alllinear_r32_lr5e4	2	940	230	852	19.681	44.348	44.783	40.865	97.136	99.112	0.145

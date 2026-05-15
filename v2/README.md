@@ -48,6 +48,37 @@ conda run -n pf-a100 python v2/unlearn.py \
   --lora_rank 8
 ```
 
+### Loss extensions
+
+The default v2 training path still uses `--method npo_KL`. Recent loss work adds optional controls for behavior-level and mechanism-level ablations:
+
+```bash
+--method npo_KL --forget_k_tokens 4
+```
+
+This limits the forget objective to the first `k` target CoT-step tokens. It is a stable baseline for blocking the start of a target reasoning step, but by itself it can still be string-level suppression.
+
+```bash
+--method npo_KL \
+  --forget_k_tokens 4 \
+  --repr_loss \
+  --repr_lambda 0.1 \
+  --repr_last_layers 4 \
+  --repr_gamma 0.9 \
+  --repr_auto_scale
+```
+
+This adds the current first-version mechanism loss: a layer-weighted hidden-state similarity penalty on the target step. `--repr_last_layers` selects the last layers, `--repr_gamma` downweights earlier selected layers, `--repr_k_tokens` can restrict the representation term to the first target tokens, and `--repr_auto_scale` rescales the auxiliary term against the current forget loss.
+
+Implementation entry points:
+
+- `mechanistic_objectives.py`: masked loss, layer-weighted representation loss, and auxiliary scaling.
+- `v2/unlearn.py`: v2 stepwise integration and CLI flags.
+- `../unlearn.py`: original pipeline integration and matching CLI flags.
+- `../imporovement/05_mechanistic_unlearning_objective_plan.md`: design notes and next mechanisms.
+
+Current status: implemented support is `first-k` forget plus representation similarity penalty. The stronger CoT-discrimination/training methods in the design note are not yet implemented: counterfactual representation loss and prototype contrastive loss. Those are the next step if the goal is to test whether the model has stopped relying on a reasoning pattern semantically, not merely stopped emitting the same target string.
+
 Multi-process launcher:
 
 ```bash

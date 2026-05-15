@@ -94,6 +94,43 @@ Sharded outputs are automatically separated by suffix. For two shards, result fi
 
 In stepwise mode, the training unit is one CoT step, not one whole instance. A single instance with N segmented CoT steps creates N adapter jobs and therefore N independent adapters, with adapter ids ending in `_step_0`, `_step_1`, and so on. The sharding logic splits these step-level jobs across processes. Retain examples are pre-encoded once per job, then each dataset access randomly samples one valid retain example instead of always reusing the first valid retain.
 
+### Current v2 post-cleanup results
+
+The current trusted v2 outputs are documented in [`docs/v2_experiment_registry.md`](docs/v2_experiment_registry.md), with a compact tracked result snapshot in [`docs/v2_postcleanup_results.tsv`](docs/v2_postcleanup_results.tsv). Raw experiment outputs are intentionally kept under `v2_outputs/` and ignored by git because they can be large; the tracked registry records the active files, archive policy, metric definitions, and final comparison table.
+
+To refresh the per-shard summary CSV from the active local outputs:
+
+```bash
+conda run -n pf-a100 python v2/summarize_results.py \
+  --results-root v2_outputs/final_results \
+  --outdir v2_outputs/reproduction/summary
+```
+
+To reproduce the post-cleanup comparison table with true question-union aggregation:
+
+```bash
+python v2/compare_postcleanup_results.py
+```
+
+Current headline comparison:
+
+| Group | Rows | Questions | Row final FF-HARD | Question final FF-HARD | Efficacy | Specificity |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `downproj_r32_lr5e4` | 940 | 230 | 4.681 | 12.609 | 68.927 | 99.995 |
+| `alllinear_lr3e4` | 940 | 230 | 11.383 | 26.957 | 89.924 | 99.851 |
+| `alllinear_r32_lr5e4` | 940 | 230 | 19.681 | 44.348 | 97.136 | 99.112 |
+
+Interpretation: LoRA is effective in v2. The low FF-HARD in the down-proj run is mainly a target-scope limitation; expanding LoRA to all linear layers substantially increases answer flips while preserving high specificity.
+
+### v2 loss extensions
+
+Recent v2 loss work adds two experimental controls on top of the original `npo_KL` path:
+
+- `--forget_k_tokens K`: restricts the forget objective to the first `K` target CoT tokens. This is a stable behavior-level baseline for blocking the beginning of a target step.
+- `--repr_loss`: adds a layer-weighted hidden-state similarity penalty, with `--repr_lambda`, `--repr_last_layers`, `--repr_gamma`, `--repr_k_tokens`, and `--repr_auto_scale` controlling strength, layers, decay, token span, and scaling.
+
+The implementation is in `mechanistic_objectives.py` and is wired into both `unlearn.py` and `v2/unlearn.py`. The design notes are in [`imporovement/05_mechanistic_unlearning_objective_plan.md`](imporovement/05_mechanistic_unlearning_objective_plan.md). The current implementation is the first engineering version: first-k forget plus a representation penalty. The longer-term CoT-discrimination/training direction in the plan is to move from token suppression toward counterfactual representation loss and prototype contrastive loss.
+
 ## Paper graphs, result files and analysis notebooks
 
 To recompute results, you need final & ablation result files (`results`,`ablations`) which are too large to share via git. Please send an email to me [\[here\]](mailto:martin.tutek@gmail.com) and I'll share the google drive links with you.
