@@ -178,6 +178,12 @@ Post-cleanup comparison, true question-union aggregation:
 | `alllinear_lr3e4` | 940 | 230 | 11.383 | 26.957 | 26.957 | 24.038 |
 | `alllinear_r32_lr5e4` | 940 | 230 | 19.681 | 44.348 | 44.783 | 40.865 |
 
+Reproduce this table with:
+
+```bash
+python v2/compare_postcleanup_results.py
+```
+
 Interpretation:
 
 - LoRA is effective in this setup: all completed post-cleanup runs strongly suppress the target CoT step while keeping specificity high.
