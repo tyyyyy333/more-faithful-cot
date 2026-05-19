@@ -1,4 +1,4 @@
-import os, sys, gc, json, copy, random, argparse, subprocess, shutil
+import os, sys, gc, json, copy, random, argparse, subprocess, shutil, csv
 from contextlib import nullcontext
 from pprint import pprint
 from collections import defaultdict
@@ -29,6 +29,7 @@ if str(_SHARED_ROOT) not in sys.path:
     sys.path.append(str(_SHARED_ROOT))
 from mechanistic_diagnostics import maybe_run_mechanistic_diagnostics
 from mechanistic_objectives import get_batch_loss_masked, representation_similarity_loss, scale_auxiliary_loss
+from causal_cot_objectives import causal_cot_frodo_loss
 
 _ACTIVE_ORACLE_CACHE = None
 _SHARED_ORACLE_MODELS = {}
@@ -40,6 +41,14 @@ _MECHANISTIC_LOSS_CONFIG = {
     'repr_gamma': 0.9,
     'repr_k_tokens': 0,
     'repr_auto_scale': False,
+}
+_CAUSAL_COT_LOSS_CONFIG = {
+    'enabled': False,
+    'lambda': 0.0,
+    'margin': 1.0,
+    'ie_lambda': 1.0,
+    'margin_lambda': 1.0,
+    'auto_scale': False,
 }
 
 def memory_stats():
@@ -99,10 +108,15 @@ def _oracle_forward_context(model, oracle_model):
 def compute_loss(model, oracle_model, inputs, loss_type='npo_grad_diff', ref_policy='fine_tuned', beta=0.1, npo_coeff=1.0, grad_diff_coeff=1.0, KL_coeff=1.0, return_outputs=False):
         oracle_cache = _ACTIVE_ORACLE_CACHE
         mech = _MECHANISTIC_LOSS_CONFIG
+        causal_cot = _CAUSAL_COT_LOSS_CONFIG
         forget_k_tokens = mech.get('forget_k_tokens', 0)
         use_repr_loss = mech.get('repr_loss', False)
         repr_outputs_flag = bool(use_repr_loss)
-        forget_inputs, retain_inputs = inputs
+        causal_cot_inputs = None
+        if len(inputs) == 3:
+            forget_inputs, retain_inputs, causal_cot_inputs = inputs
+        else:
+            forget_inputs, retain_inputs = inputs
         input_ids, labels, attention_mask = forget_inputs
         outputs = model(
             input_ids,
@@ -192,6 +206,38 @@ def compute_loss(model, oracle_model, inputs, loss_type='npo_grad_diff', ref_pol
             loss = npo_coeff * forget_loss + KL_coeff * retain_loss
         else:
             raise NotImplementedError
+
+        if causal_cot.get('enabled', False):
+            if causal_cot_inputs is None:
+                raise ValueError("--causal_cot_loss requires auxiliary causal CoT batches")
+            full_inputs, counterfactual_inputs = causal_cot_inputs
+            full_input_ids, full_labels, full_attention_mask = full_inputs
+            cf_input_ids, cf_labels, cf_attention_mask = counterfactual_inputs
+            full_outputs = model(
+                full_input_ids,
+                labels=full_labels,
+                attention_mask=full_attention_mask,
+            )
+            counterfactual_outputs = model(
+                cf_input_ids,
+                labels=cf_labels,
+                attention_mask=cf_attention_mask,
+            )
+            causal_breakdown = causal_cot_frodo_loss(
+                full_outputs.logits,
+                full_labels,
+                counterfactual_outputs.logits,
+                cf_labels,
+                margin=causal_cot.get('margin', 1.0),
+                ie_lambda=causal_cot.get('ie_lambda', 1.0),
+                margin_lambda=causal_cot.get('margin_lambda', 1.0),
+            )
+            loss = loss + scale_auxiliary_loss(
+                causal_breakdown.loss,
+                loss,
+                coeff=causal_cot.get('lambda', 0.0),
+                auto_scale=causal_cot.get('auto_scale', False),
+            )
 
         return (loss, outputs) if return_outputs else loss
 
@@ -546,6 +592,87 @@ def load_adapter_index_from_results(fin):
     )
 
 
+def load_step_importance_filter(path: str, min_score: float = 0.0, max_steps: int = 0):
+    if not path:
+      return None
+    rows = []
+    with open(path, newline='') as infile:
+      reader = csv.DictReader(infile)
+      for row in reader:
+        try:
+          score = float(row.get('importance_score', row.get('reference_prob_drop', 0.0)))
+          step_idx = int(row['step_idx'])
+        except (KeyError, TypeError, ValueError):
+          continue
+        if score < min_score:
+          continue
+        row['_importance_score_float'] = score
+        row['_step_idx_int'] = step_idx
+        rows.append(row)
+
+    rows.sort(key=lambda item: item['_importance_score_float'], reverse=True)
+    if max_steps > 0:
+      rows = rows[:max_steps]
+
+    selected = {}
+    for row in rows:
+      selected[(row.get('id', ''), row['_step_idx_int'])] = row
+    return selected
+
+
+def _encode_labeled_completion(tokenizer, prompt: str, completion: str, device):
+    prompt_ids = tokenizer.encode(prompt, add_special_tokens=False, return_tensors='pt')[0]
+    completion_ids = tokenizer.encode(completion, add_special_tokens=False, return_tensors='pt')[0]
+    if completion_ids.numel() == 0:
+      raise ValueError("Causal CoT answer completion encoded to zero tokens")
+    input_ids = torch.cat((prompt_ids, completion_ids), dim=0)
+    labels = input_ids.clone()
+    labels[:len(prompt_ids)] = -100
+    attention_mask = torch.ones_like(input_ids)
+    return (
+        input_ids.unsqueeze(0).to(device),
+        labels.unsqueeze(0).to(device),
+        attention_mask.unsqueeze(0).to(device),
+    )
+
+
+def _select_causal_cot_answer(target, answer_source: str):
+    if answer_source == 'correct':
+      return target['correct_letter']
+    if answer_source == 'cot_prediction':
+      answer_letters = ["A", "B", "C", "D", "E"]
+      return answer_letters[int(np.argmax(target['cot_probs']))]
+    raise ValueError(f"Unsupported causal CoT answer source: {answer_source}")
+
+
+def _make_counterfactual_cot(target, step_idx: int, mode: str):
+    steps = list(target.get('segmented_cot') or [])
+    if not steps:
+      return ""
+    if mode == 'remove_step':
+      return "\n".join(steps[:step_idx] + steps[step_idx + 1:]).strip()
+    if mode == 'prefix_only':
+      return "\n".join(steps[:step_idx]).strip()
+    raise ValueError(f"Unsupported causal CoT counterfactual mode: {mode}")
+
+
+def make_causal_cot_auxiliary_batch(target, step_idx: int, dh, tokenizer, device, args):
+    cot_prompt = dh.make_cot_prompt(target['raw_instance'])
+    full_cot = target['cot'].strip().split("\n\n")[0]
+    counterfactual_cot = _make_counterfactual_cot(
+        target,
+        step_idx,
+        mode=args.causal_cot_counterfactual,
+    )
+    answer = _select_causal_cot_answer(target, args.causal_cot_answer)
+    full_prompt = dh.make_answer_prompt(cot_prompt + full_cot)
+    counterfactual_prompt = dh.make_answer_prompt(cot_prompt + counterfactual_cot)
+    return (
+        _encode_labeled_completion(tokenizer, full_prompt, answer, device),
+        _encode_labeled_completion(tokenizer, counterfactual_prompt, answer, device),
+    )
+
+
 def parse_lora_target_modules(raw_value: str) -> tuple[str, ...]:
     if not raw_value.strip():
         return tuple()
@@ -618,6 +745,12 @@ def make_parser():
                         help="If > 0, only run this many training instances.")
     parser.add_argument('--max_steps_per_instance', type=int, default=0,
                         help="If > 0, only run up to this many CoT steps per instance.")
+    parser.add_argument('--step_importance_file', type=str, default="",
+                        help="Optional CSV from v2/rank_step_importance.py. If set, only selected (id, step_idx) jobs are run.")
+    parser.add_argument('--min_importance_score', type=float, default=0.0,
+                        help="Minimum importance_score required when --step_importance_file is set.")
+    parser.add_argument('--max_importance_steps', type=int, default=0,
+                        help="If > 0, keep only the top N steps after applying --min_importance_score.")
     parser.add_argument('--eval_interval', type=int, default=1,
                         help="Run evaluation every N epochs and always at the final epoch.")
     parser.add_argument('--skip_specificity', action='store_true',
@@ -642,6 +775,24 @@ def make_parser():
                         help="If > 0, only use the first k target tokens when computing the representation penalty.")
     parser.add_argument('--repr_auto_scale', action='store_true',
                         help="Auto-scale the representation penalty to the current forget-loss magnitude.")
+    parser.add_argument('--causal_cot_loss', action='store_true',
+                        help="Add a FRODO-style answer-side causal CoT auxiliary objective.")
+    parser.add_argument('--causal_cot_lambda', type=float, default=0.0,
+                        help="Weight for the causal CoT auxiliary objective.")
+    parser.add_argument('--causal_cot_margin', type=float, default=1.0,
+                        help="Margin for logp(answer|full CoT) vs logp(answer|counterfactual CoT).")
+    parser.add_argument('--causal_cot_ie_lambda', type=float, default=1.0,
+                        help="Internal weight for the indirect-effect answer likelihood term.")
+    parser.add_argument('--causal_cot_margin_lambda', type=float, default=1.0,
+                        help="Internal weight for the counterfactual margin term.")
+    parser.add_argument('--causal_cot_counterfactual', type=str, default='remove_step',
+                        choices=['remove_step', 'prefix_only'],
+                        help="Counterfactual reasoning chain used by causal CoT loss.")
+    parser.add_argument('--causal_cot_answer', type=str, default='correct',
+                        choices=['correct', 'cot_prediction'],
+                        help="Answer target used by causal CoT loss.")
+    parser.add_argument('--causal_cot_auto_scale', action='store_true',
+                        help="Auto-scale the causal CoT auxiliary loss to the current training-loss magnitude.")
     parser.add_argument('--skip_initial_eval', action='store_true',
                         help="Skip epoch-0 evaluation and only evaluate at configured intervals.")
     parser.add_argument('--lora_rank', type=int, default=8,
@@ -679,6 +830,16 @@ def main():
         'repr_k_tokens': args.repr_k_tokens,
         'repr_auto_scale': args.repr_auto_scale,
     })
+    _CAUSAL_COT_LOSS_CONFIG.update({
+        'enabled': args.causal_cot_loss,
+        'lambda': args.causal_cot_lambda,
+        'margin': args.causal_cot_margin,
+        'ie_lambda': args.causal_cot_ie_lambda,
+        'margin_lambda': args.causal_cot_margin_lambda,
+        'auto_scale': args.causal_cot_auto_scale,
+    })
+    if args.causal_cot_loss and args.causal_cot_lambda <= 0:
+      raise ValueError("--causal_cot_loss requires --causal_cot_lambda > 0")
     if args.job_shard_count < 1:
       raise ValueError("--job_shard_count must be >= 1")
     if args.job_shard_index < 0 or args.job_shard_index >= args.job_shard_count:
@@ -782,9 +943,20 @@ def main():
     collator = FRCollator(tokenizer, device=device)
 
     adapter_jobs = []
+    step_importance_filter = load_step_importance_filter(
+        args.step_importance_file,
+        min_score=args.min_importance_score,
+        max_steps=args.max_importance_steps,
+    )
+    if step_importance_filter is not None:
+      print(
+          f"Loaded {len(step_importance_filter)} selected critical steps "
+          f"from {args.step_importance_file} with min_importance_score={args.min_importance_score}"
+      )
     n_targets = min(N_unlearn, len(target_subset))
     skipped_jobs = 0
     skipped_shard_jobs = 0
+    skipped_importance_jobs = 0
     global_job_index = 0
     for idx, target in enumerate(target_subset[:n_targets]):
       n_steps = 1
@@ -794,6 +966,13 @@ def main():
         n_steps = min(n_steps, args.max_steps_per_instance)
 
       for step_idx in range(n_steps):
+        importance_row = None
+        if step_importance_filter is not None:
+          importance_row = step_importance_filter.get((target['id'], step_idx))
+          if importance_row is None:
+            skipped_importance_jobs += 1
+            continue
+
         current_job_index = global_job_index
         global_job_index += 1
         if (current_job_index % args.job_shard_count) != args.job_shard_index:
@@ -849,6 +1028,34 @@ def main():
         if args.stepwise:
           base_instance_info['cot_step'] = target['segmented_cot'][step_idx]
           base_instance_info['segmented_cot'] = target['segmented_cot']
+        if importance_row is not None:
+          base_instance_info['step_importance'] = {
+              'importance_score': float(importance_row['_importance_score_float']),
+              'margin_drop': float(importance_row.get('margin_drop', 0.0)),
+              'removed_flips_cot_prediction': int(importance_row.get('removed_flips_cot_prediction', 0)),
+              'removed_flips_full_prediction': int(importance_row.get('removed_flips_full_prediction', 0)),
+          }
+
+        causal_cot_auxiliary_batch = None
+        if args.causal_cot_loss:
+          causal_cot_auxiliary_batch = make_causal_cot_auxiliary_batch(
+              target,
+              step_idx,
+              DH,
+              tokenizer,
+              device,
+              args,
+          )
+          base_instance_info['causal_cot'] = {
+              'loss': 'frodo_reasoning_module',
+              'answer_source': args.causal_cot_answer,
+              'counterfactual': args.causal_cot_counterfactual,
+              'lambda': args.causal_cot_lambda,
+              'margin': args.causal_cot_margin,
+              'ie_lambda': args.causal_cot_ie_lambda,
+              'margin_lambda': args.causal_cot_margin_lambda,
+              'auto_scale': args.causal_cot_auto_scale,
+          }
 
         adapter_jobs.append({
             'adapter_id': adapter_id,
@@ -867,6 +1074,7 @@ def main():
                 loss_type=args.method,
                 batch_size=args.batch_size,
                 input_pad_value=collator.pad_token_id,
+                auxiliary_batch=causal_cot_auxiliary_batch,
                 metadata={
                     'target_id': target['id'],
                     'step_idx': step_idx,
@@ -878,6 +1086,8 @@ def main():
         })
 
     print(f"Pending adapter jobs: {len(adapter_jobs)} (skipped already logged jobs: {skipped_jobs})")
+    if step_importance_filter is not None:
+      print(f"Skipped {skipped_importance_jobs} jobs outside the step-importance filter")
     if args.job_shard_count > 1:
       print(
           f"Job shard {args.job_shard_index}/{args.job_shard_count}: "
@@ -907,6 +1117,19 @@ def main():
             'job_shard_count': args.job_shard_count,
             'job_shard_index': args.job_shard_index,
             'output_suffix': output_suffix,
+            'step_importance_file': args.step_importance_file,
+            'min_importance_score': args.min_importance_score,
+            'max_importance_steps': args.max_importance_steps,
+            'causal_cot': {
+                'enabled': args.causal_cot_loss,
+                'lambda': args.causal_cot_lambda,
+                'margin': args.causal_cot_margin,
+                'ie_lambda': args.causal_cot_ie_lambda,
+                'margin_lambda': args.causal_cot_margin_lambda,
+                'counterfactual': args.causal_cot_counterfactual,
+                'answer_source': args.causal_cot_answer,
+                'auto_scale': args.causal_cot_auto_scale,
+            },
             'delete_adapter_weights': delete_adapter_weights,
             'lora': {
                 'rank': args.lora_rank,
@@ -997,6 +1220,7 @@ def main():
             'target_index': job['target_index'],
             'global_job_index': job['global_job_index'],
             'question': job['target']['question'],
+            'causal_cot': dict(job['base_instance_info'].get('causal_cot', {})),
         }
         trainer.save_trained_adapter(adapter_id, adapter_path, metadata=metadata)
         record = AdapterRecord(

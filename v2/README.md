@@ -70,14 +70,42 @@ This limits the forget objective to the first `k` target CoT-step tokens. It is 
 
 This adds the current first-version mechanism loss: a layer-weighted hidden-state similarity penalty on the target step. `--repr_last_layers` selects the last layers, `--repr_gamma` downweights earlier selected layers, `--repr_k_tokens` can restrict the representation term to the first target tokens, and `--repr_auto_scale` rescales the auxiliary term against the current forget loss.
 
+```bash
+--method npo_KL \
+  --causal_cot_loss \
+  --causal_cot_lambda 0.1 \
+  --causal_cot_margin 1.0 \
+  --causal_cot_counterfactual remove_step \
+  --causal_cot_answer correct \
+  --causal_cot_auto_scale
+```
+
+This adds the Causal_CoT/FRODO-style reasoning-module loss adapted to the v2 causal-LM LoRA path. For each target step, v2 builds two answer prompts:
+
+```text
+full:           question + original CoT -> answer
+counterfactual: question + CoT with target step removed -> same answer
+```
+
+The auxiliary objective is:
+
+```text
+L_IE = -log p(answer | question, original CoT)
+L_MR = max(0, margin - (logp_full - logp_counterfactual))
+L_causal_cot = lambda * (ie_lambda * L_IE + margin_lambda * L_MR)
+```
+
+`--causal_cot_auto_scale` rescales this auxiliary term against the current unlearning loss before applying `--causal_cot_lambda`. The implementation intentionally ports the FRODO reasoning-module objective rather than the seq2seq wrapper from `Causal_CoT/src/frodo.py`, because v2 trains causal-LM LoRA adapters on stepwise jobs.
+
 Implementation entry points:
 
 - `mechanistic_objectives.py`: masked loss, layer-weighted representation loss, and auxiliary scaling.
+- `causal_cot_objectives.py`: FRODO-style answer-side IE and counterfactual margin loss.
 - `v2/unlearn.py`: v2 stepwise integration and CLI flags.
 - `../unlearn.py`: original pipeline integration and matching CLI flags.
 - `../imporovement/05_mechanistic_unlearning_objective_plan.md`: design notes and next mechanisms.
 
-Current status: implemented support is `first-k` forget plus representation similarity penalty. The stronger CoT-discrimination/training methods in the design note are not yet implemented: counterfactual representation loss and prototype contrastive loss. Those are the next step if the goal is to test whether the model has stopped relying on a reasoning pattern semantically, not merely stopped emitting the same target string.
+Current status: implemented support is `first-k` forget, representation similarity penalty, and Causal_CoT/FRODO-style answer-margin training. Counterfactual representation loss and prototype contrastive loss are still not implemented.
 
 Multi-process launcher:
 

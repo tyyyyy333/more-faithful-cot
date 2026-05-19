@@ -1,6 +1,6 @@
 # v2 Experiment Registry
 
-Last updated: 2026-05-15
+Last updated: 2026-05-19
 
 ## Active Results
 
@@ -157,6 +157,44 @@ changes.
 Loss metrics show whether optimization happened. They should be interpreted
 together with efficacy, FF-HARD, and specificity, because lower loss alone does
 not imply answer flips.
+
+## Causal_CoT And Mechanistic Ablations
+
+Final full-sample comparison after the Causal_CoT LoRA `pos=True`rerun. These metrics are recomputed from raw JSONL rows, using true question-union aggregation across shards.
+
+| Group | Rows | Questions | Row final FF-HARD | Question final FF-HARD | Question any-epoch FF-HARD | Efficacy | Specificity | Final loss |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `baseline_full` (`supp_phi3_arc_alllinear_r32_lr5e4_postcleanup`) | 940 | 230 | 19.681 | 44.348 | 44.783 | 97.136 | 99.112 | 0.145 |
+| `repr_only_full` (`test_repr_only_diag`) | 940 | 230 | 19.681 | 44.348 | 45.217 | 97.166 | 99.069 | 0.146 |
+| `firstk4_full` (`test_firstk4_only_diag`) | 940 | 230 | 17.128 | 40.000 | 40.000 | 91.545 | 98.995 | 0.206 |
+| `firstk4_repr_full` (`test_firstk4_repr_diag_clean`) | 940 | 230 | 17.128 | 40.000 | 40.000 | 91.573 | 98.979 | 0.209 |
+| `causal_cot_full_pos` (`critical_lora_causal_cot_i09_unfiltered_pos`) | 940 | 230 | 19.468 | 40.000 | 40.000 | 96.698 | 98.410 | 0.216 |
+
+Mechanistic comparison for critical-step and full-sample Causal_CoT runs:
+
+| Group | Rows | Questions | Final flip % | Efficacy | Specificity | `attn_answer_to_step_delta_last4` | `attn_answer_to_prefix_delta_last4` |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `critical_lora_baseline_i09` | 41 | 29 | 21.951 | 98.397 | 99.268 | +0.000279 | -0.002036 |
+| `critical_lora_repr_i09` | 41 | 29 | 19.512 | 98.361 | 99.390 | +0.000317 | -0.002108 |
+| `critical_lora_causal_cot_i09` (`pos=False`, not strictly comparable) | 42 | 29 | 14.286 | 96.828 | 98.929 | -0.000354 | -0.015730 |
+| `critical_lora_causal_cot_i09_unfiltered_pos` | 940 | 230 | 19.468 | 96.698 | 98.410 | -0.000572 | -0.057266 |
+
+Validation checks before upload:
+
+- No active `v2/unlearn.py` or `run_sharded_unlearn.sh` process.
+- GPU idle after completion.
+- Full Causal_CoT `pos=True` shard row counts: `547 + 393 = 940`.
+- Error-keyword scan over `logs/v2_critical_lora_causal_cot_i09_unfiltered_pos*.log` found no `Traceback`, `ERROR`, OOM, or killed-process markers.
+- Summary outputs:
+  - `v2_outputs/reproduction/critical_lora_full_pos_summary/v2_result_summary.csv`
+  - `v2_outputs/reproduction/critical_lora_full_pos_mechanistic/mechanistic_summary.tsv`
+  - `v2_outputs/reproduction/critical_lora_full_pos_mechanistic/mechanistic_rows.csv`
+
+Interpretation:
+
+- `repr_loss` does not improve over the all-linear LoRA baseline.
+- `Causal_CoT full pos=True` gives the desired negative internal attention shifts, especially `answer_to_prefix`, but does not improve final answer-flip behavior over baseline and slightly reduces specificity.
+- Current best behavior-level run remains `supp_phi3_arc_alllinear_r32_lr5e4_postcleanup`; Causal_CoT is useful as a mechanistic signal but not yet a better unlearning objective.
 
 ## Next Experiment Rule
 

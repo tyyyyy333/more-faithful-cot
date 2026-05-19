@@ -1,0 +1,92 @@
+{
+  "rows": 1947,
+  "questions": 250,
+  "removed_flips_full_prediction": 860,
+  "removed_flips_cot_prediction": 964,
+  "importance_score_mean": -0.07518581899421337,
+  "importance_score_median": -0.023099903017282486,
+  "importance_score_p90": 0.5074282303452492,
+  "importance_score_max": 0.9971822896040976,
+  "top10": [
+    {
+      "id": "Mercury_7212818",
+      "step_idx": 1,
+      "importance_score": 0.9971822896040976,
+      "margin_drop": 0.10210875907796435,
+      "removed_flips_cot_prediction": 1,
+      "step_text": "- Option (A) suggests that people need to be informed about the scientific process."
+    },
+    {
+      "id": "Mercury_7212818",
+      "step_idx": 0,
+      "importance_score": 0.9969452095683664,
+      "margin_drop": 0.053972163441358134,
+      "removed_flips_cot_prediction": 1,
+      "step_text": "- The question asks why scientists present their results to others for review."
+    },
+    {
+      "id": "Mercury_7212818",
+      "step_idx": 7,
+      "importance_score": 0.9966460827272385,
+      "margin_drop": 0.16113444158690982,
+      "removed_flips_cot_prediction": 1,
+      "step_text": "- Option (D) asserts that it ensures researchers receive credit."
+    },
+    {
+      "id": "Mercury_7212818",
+      "step_idx": 3,
+      "importance_score": 0.9955891068093479,
+      "margin_drop": 0.07217826062696986,
+      "removed_flips_cot_prediction": 1,
+      "step_text": "- Option (B) states that data often supports more than one explanation."
+    },
+    {
+      "id": "Mercury_SC_407070",
+      "step_idx": 12,
+      "importance_score": 0.9948816993273795,
+      "margin_drop": 0.13874056143686175,
+      "removed_flips_cot_prediction": 1,
+      "step_text": "Option (D) is incorrect because solid ice maintains its shape regardless of the container."
+    },
+    {
+      "id": "TAKS_2009_8_36",
+      "step_idx": 5,
+      "importance_score": 0.9940421259962022,
+      "margin_drop": 0.045769631571602076,
+      "removed_flips_cot_prediction": 1,
+      "step_text": "So, there are a total of 1 + 2 + 2 = 5 elements in the compound Mg(OH)2."
+    },
+    {
+      "id": "Mercury_402216",
+      "step_idx": 5,
+      "importance_score": 0.9917623833753169,
+      "margin_drop": 0.21125321509316564,
+      "removed_flips_cot_prediction": 1,
+      "step_text": "We need to write a balanced chemical equation for this reaction."
+    },
+    {
+      "id": "Mercury_7103600",
+      "step_idx": 1,
+      "importance_score": 0.990950545296073,
+      "margin_drop": 0.7577446841169149,
+      "removed_flips_cot_prediction": 1,
+      "step_text": "The independent variable is the one that is changed or controlled in a scientific experiment to test the effects on the dependent variable."
+    },
+    {
+      "id": "Mercury_185010",
+      "step_idx": 3,
+      "importance_score": 0.9872315609827638,
+      "margin_drop": 0.0260659362829756,
+      "removed_flips_cot_prediction": 1,
+      "step_text": "The fungus damages the tree's leaves."
+    },
+    {
+      "id": "Mercury_7212818",
+      "step_idx": 8,
+      "importance_score": 0.9819270092993975,
+      "margin_drop": 0.7288513194944244,
+      "removed_flips_cot_prediction": 1,
+      "step_text": "While recognition is important, it's not the main reason for presenting results for review."
+    }
+  ]
+}

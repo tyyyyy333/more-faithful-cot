@@ -23,6 +23,7 @@ class AdapterTrainingJob:
     input_pad_value: Optional[int] = None
     label_pad_value: int = -100
     attention_pad_value: int = 0
+    auxiliary_batch: Optional[tuple] = None
     metadata: dict = field(default_factory=dict)
 
 
@@ -62,6 +63,9 @@ class AdapterTrainer:
                 epoch_loss = 0.0
                 n_steps = 0
                 for batch in dataloader:
+                    if job.auxiliary_batch is not None:
+                        auxiliary_batch = self._expand_auxiliary_batch(job.auxiliary_batch, batch[0][0].shape[0])
+                        batch = (batch[0], batch[1], auxiliary_batch)
                     loss = compute_loss_fn(
                         self.model,
                         self.oracle_model,
@@ -100,6 +104,48 @@ class AdapterTrainer:
             padded.append(F.pad(tensor, (pad_amount, 0), value=pad_value))
         return torch.cat(padded, dim=0)
 
+    @staticmethod
+    def _expand_auxiliary_batch(auxiliary_batch, batch_size: int):
+        if auxiliary_batch is None:
+            return None
+        expanded = []
+        for encoded in auxiliary_batch:
+            encoded_parts = []
+            for tensor in encoded:
+                if tensor.shape[0] == batch_size:
+                    encoded_parts.append(tensor)
+                elif tensor.shape[0] == 1:
+                    encoded_parts.append(tensor.repeat(batch_size, *([1] * (tensor.dim() - 1))))
+                else:
+                    raise ValueError("Auxiliary batch size must be 1 or match the training batch size")
+            expanded.append(tuple(encoded_parts))
+        return tuple(expanded)
+
+    def _merge_auxiliary_batches(self, jobs: list[AdapterTrainingJob], batches: list, input_pad_value: int):
+        if not any(job.auxiliary_batch is not None for job in jobs):
+            return None
+        if not all(job.auxiliary_batch is not None for job in jobs):
+            raise ValueError("Batched adapter training cannot mix jobs with and without auxiliary batches")
+
+        expanded = []
+        for job, batch in zip(jobs, batches):
+            batch_size = batch[0][0].shape[0]
+            expanded.append(self._expand_auxiliary_batch(job.auxiliary_batch, batch_size))
+
+        full_batches = [aux[0] for aux in expanded]
+        counterfactual_batches = [aux[1] for aux in expanded]
+        merged_full = (
+            self._pad_and_concat([item[0] for item in full_batches], input_pad_value),
+            self._pad_and_concat([item[1] for item in full_batches], jobs[0].label_pad_value),
+            self._pad_and_concat([item[2] for item in full_batches], jobs[0].attention_pad_value),
+        )
+        merged_counterfactual = (
+            self._pad_and_concat([item[0] for item in counterfactual_batches], input_pad_value),
+            self._pad_and_concat([item[1] for item in counterfactual_batches], jobs[0].label_pad_value),
+            self._pad_and_concat([item[2] for item in counterfactual_batches], jobs[0].attention_pad_value),
+        )
+        return merged_full, merged_counterfactual
+
     def _merge_job_batches(self, jobs: list[AdapterTrainingJob], batches: list):
         forget_inputs = [batch[0] for batch in batches]
         retain_inputs = [batch[1] for batch in batches]
@@ -127,6 +173,9 @@ class AdapterTrainer:
             self._pad_and_concat([retain[1] for retain in retain_inputs], jobs[0].label_pad_value),
             self._pad_and_concat([retain[2] for retain in retain_inputs], jobs[0].attention_pad_value),
         )
+        merged_auxiliary = self._merge_auxiliary_batches(jobs, batches, input_pad_value)
+        if merged_auxiliary is not None:
+            return merged_forget, merged_retain, merged_auxiliary
         return merged_forget, merged_retain
 
     def train_job_group_batched(self, jobs: list[AdapterTrainingJob], compute_loss_fn: Callable,
@@ -235,6 +284,7 @@ class AdapterTrainer:
             job.input_pad_value,
             job.label_pad_value,
             job.attention_pad_value,
+            job.auxiliary_batch is not None,
             type(job.collator),
         )
 

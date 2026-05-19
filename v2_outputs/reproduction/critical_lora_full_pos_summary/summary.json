@@ -1,0 +1,6 @@
+{
+  "results_root": "v2_outputs/final_results",
+  "files_found": 20,
+  "rows_written": 20,
+  "csv": "v2_outputs/reproduction/critical_lora_full_pos_summary/v2_result_summary.csv"
+}
