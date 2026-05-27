@@ -1,6 +1,6 @@
 # v2 Experiment Registry
 
-Last updated: 2026-05-19
+Last updated: 2026-05-27
 
 ## Active Results
 
@@ -195,6 +195,27 @@ Interpretation:
 - `repr_loss` does not improve over the all-linear LoRA baseline.
 - `Causal_CoT full pos=True` gives the desired negative internal attention shifts, especially `answer_to_prefix`, but does not improve final answer-flip behavior over baseline and slightly reduces specificity.
 - Current best behavior-level run remains `supp_phi3_arc_alllinear_r32_lr5e4_postcleanup`; Causal_CoT is useful as a mechanistic signal but not yet a better unlearning objective.
+
+## First-k Sweep
+
+Full-sample first-k sweep for the forget objective. These runs use Phi-3 mini on ARC-Challenge with `npo_KL`, `lr=5e-4`, LoRA rank 16/alpha 32, two shards, and mechanistic diagnostics. Each row below merges `547 + 393 = 940` adapter-step rows over 230 questions.
+
+| k | Rows | Questions | Final flip % | Efficacy | Specificity | `repr_step_answer_delta_last4` | `attn_answer_to_prefix_delta_last4` |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 940 | 230 | 13.085 | 86.818 | 99.064 | -0.055519 | -0.011605 |
+| 2 | 940 | 230 | 13.936 | 88.883 | 98.947 | -0.052321 | -0.010661 |
+| 4 | 940 | 230 | 17.128 | 91.545 | 98.995 | -0.045560 | -0.007387 |
+| 8 | 940 | 230 | 19.574 | 95.158 | 99.085 | -0.035321 | -0.003119 |
+| 16 | 940 | 230 | 19.787 | 96.900 | 99.085 | -0.031232 | -0.000997 |
+
+Interpretation: the behavioral effect is strongly front-loaded. `k=4` already recovers most of the observed first-k effect, while `k=8` and `k=16` are close to saturation. This supports the "tip-of-the-pen forgetting" hypothesis: disrupting the target step prefix often blocks the rest of the reasoning trajectory, though later tokens still provide some marginal unlearning gain.
+
+Detailed report: `docs/v2_firstk_sweep_results.md`.
+
+Summary artifacts:
+
+- `v2_outputs/reproduction/firstk_sweep/summary/v2_result_summary.csv`
+- `v2_outputs/reproduction/firstk_sweep/mechanistic/mechanistic_summary.tsv`
 
 ## Next Experiment Rule
 
